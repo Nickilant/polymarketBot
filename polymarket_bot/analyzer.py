@@ -28,18 +28,23 @@ class Analyzer:
         top_n: int,
     ) -> list[InsiderSignal]:
         market_by_id = {m.market_id: m for m in markets}
+        market_by_name = {m.market_name.strip().lower(): m for m in markets}
         max_trade_by_key: dict[tuple[str, str, str], float] = defaultdict(float)
         last_trade: dict[tuple[str, str, str], dict[str, Any]] = {}
 
         for trade in trades:
-            market_id = str(trade.get("market") or trade.get("marketId") or "")
-            wallet = str(trade.get("maker") or trade.get("trader") or trade.get("wallet") or "")
+            market_id = str(
+                trade.get("market")
+                or trade.get("marketId")
+                or trade.get("conditionId")
+                or ""
+            )
+            wallet = str(trade.get("maker") or trade.get("trader") or trade.get("wallet") or trade.get("proxyWallet") or "")
             outcome = str(trade.get("outcome") or trade.get("side") or "").strip() or "N/A"
             if not market_id or not wallet:
                 continue
-            try:
-                size = float(trade.get("usdcSize") or trade.get("size") or trade.get("amount") or 0)
-            except (TypeError, ValueError):
+            size = self._trade_size_usd(trade)
+            if size is None:
                 continue
 
             key = (market_id, wallet, outcome)
@@ -54,9 +59,13 @@ class Analyzer:
                 continue
             market_id, wallet, outcome = key
             market = market_by_id.get(market_id)
+            trade = last_trade[key]
+            if not market:
+                title = str(trade.get("title") or "").strip().lower()
+                if title:
+                    market = market_by_name.get(title)
             if not market:
                 continue
-            trade = last_trade[key]
             price = float(trade.get("price") or trade.get("outcomePrice") or 0.5)
             name_ru = self._translator.translate(market.market_name)
             signals.append(
@@ -127,6 +136,23 @@ class Analyzer:
                 )
             )
         return signals
+
+    @staticmethod
+    def _trade_size_usd(trade: dict[str, Any]) -> float | None:
+        raw_usdc_size = trade.get("usdcSize") or trade.get("amount")
+        if raw_usdc_size not in (None, ""):
+            try:
+                return abs(float(raw_usdc_size))
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            size = abs(float(trade.get("size") or 0))
+            price = float(trade.get("price") or trade.get("outcomePrice") or 0)
+        except (TypeError, ValueError):
+            return None
+
+        return size * price if price > 0 else size
 
     @staticmethod
     def _win_if_one_dollar(probability: float) -> float:

@@ -32,8 +32,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("polymarket-telegram-bot")
 
-INSIDER_CHECK_INTERVAL_SECONDS = 600
-INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=10)
+INSIDER_CHECK_INTERVAL_SECONDS = 300
+INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=5)
 PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=12)
 HOT_ANALYSIS_INTERVAL = timedelta(hours=1)
 PRO_PRICE_STARS = 150
@@ -41,7 +41,7 @@ PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
 
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
-    lines = ["🕵️ Инсайдерская торговля (топ-3):"]
+    lines = ["💰 Крупные ставки (топ-3):"]
     for idx, signal in enumerate(signals, start=1):
         price = max(0.01, min(0.99, signal.price))
         profit = (1.0 / price) - 1.0
@@ -104,9 +104,9 @@ def welcome_text() -> str:
     return (
         "Привет! Я бот с сигналами Polymarket.\n\n"
         "Что отправляю:\n"
-        "• Инсайдерские сделки — крупные ставки от одного кошелька (по мере обнаружения).\n"
+        "• Крупные ставки — крупные ставки от одного кошелька (каждые 5 минут).\n"
         "• Высокая вероятность — ставки с высокой вероятностью выигрыша (раз в 12 часов).\n"
-        "• Горячие ставки — ставки с высокой вероятностю выигрыша и близким закрытием.\n\n"
+        "• Горячие ставки — по одной лучшей ставке каждый час без повторов в течение суток.\n\n"
         "Тарифы:\n"
         "• Free: только ставки высокой вероятности раз в 2 дня\n"
         "• Pro: полный комплект информации\n"
@@ -182,7 +182,7 @@ class BotService:
             return
 
         title = "Подписка Pro150 на 30 дней"
-        description = "Сигналы Pro: высокая вероятность раз в 12 часов, hot раз в час, инсайдеры каждые 10 минут при новых сделках."
+        description = "Сигналы Pro: высокая вероятность раз в 12 часов, крупные ставки каждые 5 минут, горячие ставки раз в час."
         payload = f"{PRO_INVOICE_PAYLOAD_PREFIX}:{update.effective_user.id}:{int(datetime.now(timezone.utc).timestamp())}"
 
         await context.bot.send_invoice(
@@ -269,7 +269,7 @@ class BotService:
             "🧾 Последние данные анализа\n"
             f"Время UTC: {payload.get('generated_at', '-')}\n"
             f"Рынков: {payload.get('markets_count', 0)}\n"
-            f"Инсайдерских сигналов: {payload.get('insider_signals_count', 0)}\n"
+            f"Крупных ставок: {payload.get('insider_signals_count', 0)}\n"
             f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}\n"
             f"Горячих сигналов: {payload.get('hot_signals_count', 0)}"
         ))
@@ -278,7 +278,7 @@ class BotService:
         probability_signals = [ProbabilitySignal(**raw) for raw in payload.get("probability_signals", [])]
         hot_signals = [ProbabilitySignal(**raw) for raw in payload.get("hot_signals", [])]
 
-        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals) if insider_signals else "🕵️ Инсайдерская торговля: сигналов нет.")
+        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals) if insider_signals else "💰 Крупные ставки: сигналов нет.")
         await context.bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_hot_message(hot_signals), parse_mode="HTML")
 
@@ -293,7 +293,7 @@ class BotService:
         admin_sub = self.store.ensure_free(self.settings.admin_chat_id)
         lines = [
             "⏱ Следующее время рассылки подписчикам (UTC):",
-            f"Инсайдеры (Pro + админ): {self._next_due_for_label(admin_sub, 'insider', now)}",
+            f"Крупные ставки (Pro + админ): {self._next_due_for_label(admin_sub, 'insider', now)}",
             f"Вероятность (Pro + админ): {self._next_due_for_label(admin_sub, 'probability', now)}",
             f"Вероятность (Free): {self._next_due_for_label(self._free_reference_subscription(now), 'probability', now)}",
             f"Горячие (Pro + админ): {self._next_due_for_label(admin_sub, 'hot', now)}",
@@ -345,6 +345,33 @@ class BotService:
         ]
         return json.dumps(payload, ensure_ascii=False)
 
+
+    @staticmethod
+    def _daily_hot_reset_time(now: datetime) -> datetime:
+        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+    def _pick_next_hot_signal(self, hot_signals: list[ProbabilitySignal], now: datetime) -> ProbabilitySignal | None:
+        if not hot_signals:
+            return None
+
+        sent_ids, reset_at = self.store.get_global_hot_progress()
+        if reset_at is None or now >= reset_at:
+            sent_ids = []
+            reset_at = self._daily_hot_reset_time(now)
+
+        sent_set = set(sent_ids)
+        available = [signal for signal in hot_signals if signal.market_id not in sent_set]
+
+        if not available:
+            sent_ids = []
+            reset_at = self._daily_hot_reset_time(now)
+            available = hot_signals
+
+        selected = available[0]
+        sent_ids.append(selected.market_id)
+        self.store.set_global_hot_progress(sent_ids, reset_at)
+        return selected
+
     def _interval_for_label(self, sub: UserSubscription, label: str) -> timedelta | None:
         if sub.user_id == self.settings.admin_chat_id:
             if label == "insider":
@@ -391,7 +418,7 @@ class BotService:
         if analysis_due_at is not None and analysis_due_at > due_at:
             due_at = analysis_due_at
         if due_at <= now:
-            return now.isoformat(timespec="seconds")
+            return (now + timedelta(minutes=5)).isoformat(timespec="seconds")
         return due_at.isoformat(timespec="seconds")
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
@@ -432,7 +459,7 @@ class BotService:
 
     async def _notify_admin_analysis_started(self, label: str, now: datetime) -> None:
         labels = {
-            "insider": "инсайдерских ставок",
+            "insider": "крупных ставок",
             "probability": "высокой вероятности",
             "hot": "горячих ставок",
         }
@@ -443,7 +470,7 @@ class BotService:
 
     async def _notify_admin_distribution(self, label: str, sent_count: int, now: datetime) -> None:
         labels = {
-            "insider": "инсайдерских ставок",
+            "insider": "крупных ставок",
             "probability": "высокой вероятности",
             "hot": "горячих ставок",
         }
@@ -470,7 +497,7 @@ class BotService:
             "🧪 Короткий отчёт анализа\n"
             f"UTC: {now.isoformat(timespec='seconds')}\n"
             f"Рынков: {markets_count}\n"
-            f"Инсайдеры: {insider_signals_count} ({'изменились' if insider_changed else 'без изменений'})\n"
+            f"Крупные ставки: {insider_signals_count} ({'изменились' if insider_changed else 'без изменений'})\n"
             f"Вероятность: {probability_signals_count}\n"
             f"Горячие: {hot_signals_count} ({'изменились' if hot_changed else 'без изменений'})"
         )
@@ -523,10 +550,11 @@ class BotService:
             insider_signature,
         )
 
+        selected_hot_signal = self._pick_next_hot_signal(hot_signals, now) if hot_due else None
         messages = {
             "insider": format_insider_message(insider_signals) if insider_signals else "",
             "probability": format_probability_message(probability_signals),
-            "hot": format_hot_message(hot_signals),
+            "hot": format_hot_message([selected_hot_signal]) if selected_hot_signal else "",
         }
 
         await self._send_admin_cycle_report(
@@ -562,13 +590,17 @@ class BotService:
                     continue
                 if not self._mode_allows_label(sub, label):
                     continue
-                if not self._is_due(sub, label, now):
+                if label != "hot" and not self._is_due(sub, label, now):
                     continue
                 if label == "insider" and not insider_signals:
                     continue
 
                 parse_mode = "HTML" if label in {"probability", "hot"} else None
+                if label == "hot" and not messages["hot"]:
+                    continue
+
                 await self.sender.send_to(sub.user_id, messages[label], parse_mode=parse_mode)
+
                 self.store.mark_sent(sub.user_id, label, now)
                 sent_users.add(sub.user_id)
                 sent_by_label[label] += 1
