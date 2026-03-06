@@ -24,6 +24,7 @@ class ProbabilitySignal:
     second_probability: float
     gap: float
     win_if_1_dollar: float
+    market_url: str
 
 
 @dataclass(frozen=True)
@@ -32,3 +33,4 @@ class MarketView:
     market_name: str
     outcomes: list[str]
     probabilities: list[float]
+    market_url: str

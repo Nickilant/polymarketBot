@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from polymarket_bot.analyzer import Analyzer
 from polymarket_bot.config import Settings, load_settings
+from polymarket_bot.models import InsiderSignal, ProbabilitySignal
 from polymarket_bot.polymarket_client import PolymarketClient
 from polymarket_bot.subscriptions import PRO_PLAN, SubscriptionStore, VALID_MODES
 from polymarket_bot.telegram_sender import TelegramSender
@@ -22,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger("polymarket-telegram-bot")
 
 
-def format_insider_message(signals):
+def format_insider_message(signals: list[InsiderSignal]) -> str:
     if not signals:
         return "🕵️ Инсайдерские сделки: за последний период крупных сделок не найдено."
 
@@ -40,18 +45,23 @@ def format_insider_message(signals):
     return "\n\n".join(lines)
 
 
-def format_probability_message(signals):
+def format_probability_message(signals: list[ProbabilitySignal]) -> str:
     if not signals:
         return "📈 Высокая вероятность: подходящих рынков сейчас нет."
 
     lines = ["📈 Высокая вероятность (топ-10):"]
     for idx, signal in enumerate(signals, start=1):
+        safe_name = html.escape(signal.market_name_ru)
+        safe_outcome = html.escape(signal.leading_outcome)
+        safe_url = html.escape(signal.market_url, quote=True)
+        link_line = f"<a href=\"{safe_url}\">ссылка на маркет</a>" if signal.market_url else "ссылка на маркет: недоступна"
         lines.append(
             (
-                f"{idx}) {signal.market_name_ru}\n"
-                f"Лидер: {signal.leading_outcome} ({signal.leading_probability * 100:.1f}%)"
+                f"{idx}) {safe_name}\n"
+                f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
                 f" | Отрыв: {signal.gap * 100:.1f}%\n"
-                f"Профит с $1: ${signal.win_if_1_dollar:.2f}"
+                f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
+                f"{link_line}"
             )
         )
     return "\n\n".join(lines)
@@ -86,6 +96,8 @@ class BotService:
         )
         self.application = Application.builder().token(settings.telegram_token).build()
         self._last_admin_heartbeat_sent: datetime | None = None
+        self._analysis_cache_path = Path(settings.subscriptions_db).resolve().parent / "latest_analysis.json"
+        self._analysis_lock = asyncio.Lock()
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -96,6 +108,7 @@ class BotService:
         self.application.add_handler(CommandHandler("buy", self.cmd_buy))
         self.application.add_handler(CommandHandler("stop", self.cmd_stop))
         self.application.add_handler(CommandHandler("grant", self.cmd_grant))
+        self.application.add_handler(CommandHandler("analysis", self.cmd_analysis))
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
@@ -165,6 +178,41 @@ class BotService:
         except Exception:
             logger.warning("Could not notify user %s", user_id)
 
+    async def cmd_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not update.effective_chat:
+            return
+        if update.effective_user.id != self.settings.admin_chat_id:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Команда только для админа")
+            return
+
+        payload = await self._load_analysis_snapshot()
+        if not payload:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Анализ ещё не запускался.")
+            return
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "🧾 Последние данные анализа\n"
+                f"Время UTC: {payload.get('generated_at', '-') }\n"
+                f"Рынков: {payload.get('markets_count', 0)}\n"
+                f"Инсайдерских сигналов: {payload.get('insider_signals_count', 0)}\n"
+                f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}"
+            ),
+        )
+        if self.settings.analysis_mode in {"insider", "both"}:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=format_insider_message(self._restore_insider_signals(payload.get("insider_signals", []))),
+            )
+        if self.settings.analysis_mode in {"probability", "both"}:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=format_probability_message(self._restore_probability_signals(payload.get("probability_signals", []))),
+                disable_web_page_preview=True,
+                parse_mode="HTML",
+            )
+
     async def analysis_loop(self) -> None:
         logger.info("Запущен цикл анализа. Интервал опроса: %s сек.", self.settings.polling_interval_seconds)
         while True:
@@ -194,8 +242,8 @@ class BotService:
         logger.info("Запрашиваю рынки Polymarket")
         markets = await self.client.fetch_markets()
         logger.info("Получено рынков: %s", len(markets))
-        insider_signals = []
-        probability_signals = []
+        insider_signals: list[InsiderSignal] = []
+        probability_signals: list[ProbabilitySignal] = []
 
         if self.settings.analysis_mode in {"insider", "both"}:
             logger.info("Режим включает инсайдерский анализ — загружаю последние сделки")
@@ -208,13 +256,16 @@ class BotService:
             probability_signals = self.analyzer.probability_signals(markets, top_n=self.settings.probability_top_n)
             logger.info("Найдено сигналов высокой вероятности: %s", len(probability_signals))
 
+        await self._save_analysis_snapshot(now, markets, insider_signals, probability_signals)
+
         insider_text = format_insider_message(insider_signals)
         probability_text = format_probability_message(probability_signals)
 
-        # Admin always receives both reports every cycle.
+        sent_labels: set[tuple[int, str]] = set()
+
         logger.info("Отправляю оба отчёта админу %s", self.settings.admin_chat_id)
-        await self.sender.send_to(self.settings.admin_chat_id, insider_text)
-        await self.sender.send_to(self.settings.admin_chat_id, probability_text)
+        await self._send_unique(self.settings.admin_chat_id, "insider", insider_text, sent_labels)
+        await self._send_unique(self.settings.admin_chat_id, "probability", probability_text, sent_labels)
 
         reminder_count = 0
         for user_id, days, paid_until in self.store.due_renewal_reminders(now):
@@ -234,19 +285,65 @@ class BotService:
 
         sent_users = 0
         for sub in self.store.active_users_due(now):
-            messages: list[str] = []
+            if sub.user_id == self.settings.admin_chat_id:
+                continue
+            messages: list[tuple[str, str]] = []
             if sub.mode in {"insider", "both"} and self.settings.analysis_mode in {"insider", "both"}:
-                messages.append(insider_text)
+                messages.append(("insider", insider_text))
             if sub.mode in {"probability", "both"} and self.settings.analysis_mode in {"probability", "both"}:
-                messages.append(probability_text)
+                messages.append(("probability", probability_text))
             if not messages:
                 continue
-            for message in messages:
-                await self.sender.send_to(sub.user_id, message)
+            for label, message in messages:
+                await self._send_unique(sub.user_id, label, message, sent_labels)
             self.store.mark_sent(sub.user_id, now)
             sent_users += 1
 
         logger.info("Цикл завершён. Пользователей, получивших рассылку: %s", sent_users)
+
+    async def _send_unique(self, chat_id: int, label: str, text: str, sent_labels: set[tuple[int, str]]) -> None:
+        key = (chat_id, label)
+        if key in sent_labels:
+            return
+        parse_mode = "HTML" if label == "probability" else None
+        await self.sender.send_to(chat_id, text, parse_mode=parse_mode)
+        sent_labels.add(key)
+
+    async def _save_analysis_snapshot(
+        self,
+        now: datetime,
+        markets: list[Any],
+        insider_signals: list[InsiderSignal],
+        probability_signals: list[ProbabilitySignal],
+    ) -> None:
+        payload = {
+            "generated_at": now.isoformat(timespec="seconds"),
+            "markets_count": len(markets),
+            "insider_signals_count": len(insider_signals),
+            "probability_signals_count": len(probability_signals),
+            "insider_signals": [signal.__dict__ for signal in insider_signals],
+            "probability_signals": [signal.__dict__ for signal in probability_signals],
+        }
+        async with self._analysis_lock:
+            self._analysis_cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    async def _load_analysis_snapshot(self) -> dict[str, Any] | None:
+        async with self._analysis_lock:
+            if not self._analysis_cache_path.exists():
+                return None
+            try:
+                return json.loads(self._analysis_cache_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                logger.warning("Повреждён файл кэша анализа: %s", self._analysis_cache_path)
+                return None
+
+    @staticmethod
+    def _restore_insider_signals(rows: list[dict[str, Any]]) -> list[InsiderSignal]:
+        return [InsiderSignal(**row) for row in rows if isinstance(row, dict)]
+
+    @staticmethod
+    def _restore_probability_signals(rows: list[dict[str, Any]]) -> list[ProbabilitySignal]:
+        return [ProbabilitySignal(**row) for row in rows if isinstance(row, dict)]
 
     async def run(self) -> None:
         logger.info("Инициализирую Telegram-приложение")
@@ -256,9 +353,12 @@ class BotService:
         logger.info("Включаю long polling")
         await self.application.updater.start_polling()
         await self._send_startup_message_to_admin()
+        analysis_task = asyncio.create_task(self.analysis_loop(), name="analysis-loop")
         try:
-            await self.analysis_loop()
+            await asyncio.Event().wait()
         finally:
+            analysis_task.cancel()
+            await asyncio.gather(analysis_task, return_exceptions=True)
             logger.info("Останавливаю long polling")
             await self.application.updater.stop()
             logger.info("Останавливаю Telegram-приложение")
@@ -272,7 +372,8 @@ class BotService:
             f"Режим анализа: {self.settings.analysis_mode}\n"
             f"Интервал цикла: {self.settings.polling_interval_seconds} сек.\n\n"
             "Справка по командам:\n"
-            f"{welcome_text()}"
+            f"{welcome_text()}\n\n"
+            "Админ-команда: /analysis — показать последние данные анализа."
         )
         logger.info("Отправляю приветственное сообщение при старте админу %s", self.settings.admin_chat_id)
         await self.sender.send_to(self.settings.admin_chat_id, startup_text)

@@ -73,7 +73,10 @@ class Analyzer:
 
     def probability_signals(self, markets: list[MarketView], top_n: int) -> list[ProbabilitySignal]:
         signals: list[ProbabilitySignal] = []
+        seen_markets: set[str] = set()
         for market in markets:
+            if market.market_id in seen_markets:
+                continue
             paired = list(zip(market.outcomes, market.probabilities))
             if len(paired) < 2:
                 continue
@@ -86,6 +89,9 @@ class Analyzer:
 
             name_ru = self._translator.translate(market.market_name)
             win = self._win_if_one_dollar(lead_prob)
+            if win <= 0.1:
+                continue
+            seen_markets.add(market.market_id)
             signals.append(
                 ProbabilitySignal(
                     market_id=market.market_id,
@@ -96,6 +102,7 @@ class Analyzer:
                     second_probability=second_prob,
                     gap=gap,
                     win_if_1_dollar=win,
+                    market_url=market.market_url,
                 )
             )
 

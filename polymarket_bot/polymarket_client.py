@@ -65,6 +65,7 @@ class PolymarketClient:
             market_name=name,
             outcomes=outcomes,
             probabilities=prices,
+            market_url=self._parse_market_url(item),
         )
 
     @staticmethod
@@ -82,6 +83,18 @@ class PolymarketClient:
             except json.JSONDecodeError:
                 pass
         return []
+
+
+    @staticmethod
+    def _parse_market_url(item: dict[str, Any]) -> str:
+        direct_url = str(item.get("url") or "").strip()
+        if direct_url:
+            return direct_url
+
+        slug = str(item.get("slug") or item.get("marketSlug") or "").strip().strip("/")
+        if slug:
+            return f"https://polymarket.com/event/{slug}"
+        return ""
 
     def _parse_probabilities(self, item: dict[str, Any]) -> list[float]:
         for field in ("outcomePrices", "probabilities"):
