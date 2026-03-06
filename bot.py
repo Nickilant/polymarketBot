@@ -85,6 +85,7 @@ class BotService:
             probability_min_value=settings.probability_min_value,
         )
         self.application = Application.builder().token(settings.telegram_token).build()
+        self._last_admin_heartbeat_sent: datetime | None = None
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -165,34 +166,57 @@ class BotService:
             logger.warning("Could not notify user %s", user_id)
 
     async def analysis_loop(self) -> None:
+        logger.info("Запущен цикл анализа. Интервал опроса: %s сек.", self.settings.polling_interval_seconds)
         while True:
             now = datetime.now(timezone.utc)
             try:
+                await self._maybe_send_admin_heartbeat(now)
                 await self._run_cycle(now)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Cycle failed: %s", exc)
+                logger.exception("Ошибка в цикле анализа: %s", exc)
             await asyncio.sleep(self.settings.polling_interval_seconds)
 
+    async def _maybe_send_admin_heartbeat(self, now: datetime) -> None:
+        if self._last_admin_heartbeat_sent and (now - self._last_admin_heartbeat_sent).total_seconds() < 3600:
+            return
+
+        heartbeat_text = (
+            "🫀 Служебный пинг бота\n"
+            f"Время UTC: {now.isoformat(timespec='seconds')}\n"
+            "Статус: бот запущен и выполняет цикл анализа."
+        )
+        logger.info("Отправляю служебный часовой пинг админу %s", self.settings.admin_chat_id)
+        await self.sender.send_to(self.settings.admin_chat_id, heartbeat_text)
+        self._last_admin_heartbeat_sent = now
+
     async def _run_cycle(self, now: datetime) -> None:
-        logger.info("Starting analysis cycle")
+        logger.info("Старт цикла анализа за %s", now.isoformat(timespec="seconds"))
+        logger.info("Запрашиваю рынки Polymarket")
         markets = await self.client.fetch_markets()
+        logger.info("Получено рынков: %s", len(markets))
         insider_signals = []
         probability_signals = []
 
         if self.settings.analysis_mode in {"insider", "both"}:
+            logger.info("Режим включает инсайдерский анализ — загружаю последние сделки")
             trades = await self.client.fetch_recent_trades()
             insider_signals = self.analyzer.insider_signals(trades, markets, top_n=self.settings.insider_top_n)
+            logger.info("Найдено инсайдерских сигналов: %s", len(insider_signals))
 
         if self.settings.analysis_mode in {"probability", "both"}:
+            logger.info("Режим включает анализ вероятностей — строю сигналы")
             probability_signals = self.analyzer.probability_signals(markets, top_n=self.settings.probability_top_n)
+            logger.info("Найдено сигналов высокой вероятности: %s", len(probability_signals))
 
         insider_text = format_insider_message(insider_signals)
         probability_text = format_probability_message(probability_signals)
 
         # Admin always receives both reports every cycle.
+        logger.info("Отправляю оба отчёта админу %s", self.settings.admin_chat_id)
         await self.sender.send_to(self.settings.admin_chat_id, insider_text)
         await self.sender.send_to(self.settings.admin_chat_id, probability_text)
 
+        reminder_count = 0
         for user_id, days, paid_until in self.store.due_renewal_reminders(now):
             reminder_text = (
                 f"⏳ До окончания Pro150 осталось {days} дн.\n"
@@ -201,7 +225,14 @@ class BotService:
             )
             await self.sender.send_to(user_id, reminder_text)
             self.store.mark_reminder_sent(user_id, days, paid_until)
+            reminder_count += 1
 
+        if reminder_count:
+            logger.info("Отправлено напоминаний о продлении: %s", reminder_count)
+        else:
+            logger.info("Напоминаний о продлении в этом цикле нет")
+
+        sent_users = 0
         for sub in self.store.active_users_due(now):
             messages: list[str] = []
             if sub.mode in {"insider", "both"} and self.settings.analysis_mode in {"insider", "both"}:
@@ -213,17 +244,38 @@ class BotService:
             for message in messages:
                 await self.sender.send_to(sub.user_id, message)
             self.store.mark_sent(sub.user_id, now)
+            sent_users += 1
+
+        logger.info("Цикл завершён. Пользователей, получивших рассылку: %s", sent_users)
 
     async def run(self) -> None:
+        logger.info("Инициализирую Telegram-приложение")
         await self.application.initialize()
+        logger.info("Запускаю Telegram-приложение")
         await self.application.start()
+        logger.info("Включаю long polling")
         await self.application.updater.start_polling()
+        await self._send_startup_message_to_admin()
         try:
             await self.analysis_loop()
         finally:
+            logger.info("Останавливаю long polling")
             await self.application.updater.stop()
+            logger.info("Останавливаю Telegram-приложение")
             await self.application.stop()
+            logger.info("Завершаю Telegram-приложение")
             await self.application.shutdown()
+
+    async def _send_startup_message_to_admin(self) -> None:
+        startup_text = (
+            "✅ Бот запущен и готов к работе.\n\n"
+            f"Режим анализа: {self.settings.analysis_mode}\n"
+            f"Интервал цикла: {self.settings.polling_interval_seconds} сек.\n\n"
+            "Справка по командам:\n"
+            f"{welcome_text()}"
+        )
+        logger.info("Отправляю приветственное сообщение при старте админу %s", self.settings.admin_chat_id)
+        await self.sender.send_to(self.settings.admin_chat_id, startup_text)
 
 
 async def main() -> None:
