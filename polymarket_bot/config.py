@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from dotenv import load_dotenv
 
 
@@ -37,11 +38,9 @@ def load_settings() -> Settings:
     if mode not in {"insider", "probability", "both"}:
         raise ValueError("ANALYSIS_MODE must be one of: insider, probability, both")
 
-    subscriptions_db = (
-        os.getenv("SUBSCRIPTIONS_DB", "").strip()
-        or os.getenv("SUBSCRIPTIONS_FILE", "").strip()
-        or "subscriptions.db"
-    )
+    base_dir = Path(__file__).resolve().parent.parent
+    env_db = os.getenv("SUBSCRIPTIONS_DB", "").strip() or os.getenv("SUBSCRIPTIONS_FILE", "").strip()
+    subscriptions_db = str((Path(env_db).expanduser() if env_db else base_dir / "subscriptions.db").resolve())
 
     return Settings(
         telegram_token=token,
