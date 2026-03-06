@@ -8,8 +8,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import LabeledPrice, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    filters,
+)
 
 from polymarket_bot.analyzer import Analyzer
 from polymarket_bot.config import Settings, load_settings
@@ -27,6 +34,8 @@ logging.basicConfig(
 logger = logging.getLogger("polymarket-telegram-bot")
 
 INSIDER_CHECK_INTERVAL_SECONDS = 600
+PRO_PRICE_STARS = 150
+PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
 
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
@@ -97,7 +106,7 @@ def welcome_text() -> str:
         "• Высокая вероятность — 2 раза в день (Pro).\n"
         "• Горячие ставки — раз в 3 часа, только если есть изменения (Pro).\n"
         "• Бесплатный тариф: только высокая вероятность 1 раз в 2 дня.\n\n"
-        "Покупка Stars: @PremiumBot\n"
+        "Купить Pro можно прямо в боте через /buy (Telegram Stars).\n"
         "Команды: /mode insider|probability|hot|both, /my, /buy, /stop"
     )
 
@@ -129,6 +138,8 @@ class BotService:
         self.application.add_handler(CommandHandler("stop", self.cmd_stop))
         self.application.add_handler(CommandHandler("grant", self.cmd_grant))
         self.application.add_handler(CommandHandler("analysis", self.cmd_analysis))
+        self.application.add_handler(PreCheckoutQueryHandler(self.precheckout_callback))
+        self.application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.successful_payment_callback))
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
@@ -158,9 +169,56 @@ class BotService:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Тариф: {plan}\nРежим: {sub.mode}\nPro до: {paid_until}")
 
     async def cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat:
+        if not update.effective_user or not update.effective_chat:
             return
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Тариф Pro150 = 150 ⭐ за 30 дней. Купи Stars в @PremiumBot и напиши админу для активации.")
+
+        title = "Подписка Pro150 на 30 дней"
+        description = "Сигналы Pro: высокая вероятность 2 раза в день, hot раз в 3 часа (при изменениях), инсайдеры каждые 10 минут при новых сделках."
+        payload = f"{PRO_INVOICE_PAYLOAD_PREFIX}:{update.effective_user.id}:{int(datetime.now(timezone.utc).timestamp())}"
+
+        await context.bot.send_invoice(
+            chat_id=update.effective_chat.id,
+            title=title,
+            description=description,
+            payload=payload,
+            currency="XTR",
+            prices=[LabeledPrice("Pro150", PRO_PRICE_STARS)],
+            provider_token=self.settings.telegram_payments_provider_token,
+            start_parameter="pro150-stars",
+        )
+
+
+    async def precheckout_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.pre_checkout_query:
+            return
+        query = update.pre_checkout_query
+        if not query.invoice_payload.startswith(f"{PRO_INVOICE_PAYLOAD_PREFIX}:"):
+            await query.answer(ok=False, error_message="Неверный payload платежа")
+            return
+        if query.currency != "XTR" or query.total_amount != PRO_PRICE_STARS:
+            await query.answer(ok=False, error_message="Неверная сумма платежа")
+            return
+        await query.answer(ok=True)
+
+    async def successful_payment_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message or not update.effective_user:
+            return
+        payment = update.message.successful_payment
+        if payment is None:
+            return
+        if not payment.invoice_payload.startswith(f"{PRO_INVOICE_PAYLOAD_PREFIX}:"):
+            logger.warning("Неизвестный payload успешной оплаты: %s", payment.invoice_payload)
+            return
+        if payment.currency != "XTR" or payment.total_amount != PRO_PRICE_STARS:
+            logger.warning("Неожиданные параметры успешной оплаты: currency=%s amount=%s", payment.currency, payment.total_amount)
+            return
+
+        sub = self.store.grant_pro(update.effective_user.id)
+        await update.message.reply_text(f"✅ Оплата получена! Pro150 активирован до {sub.paid_until.date().isoformat()}")
+        await self.sender.send_to(
+            self.settings.admin_chat_id,
+            f"💳 Успешная оплата Stars: user_id={update.effective_user.id}, сумма={payment.total_amount} XTR",
+        )
 
     async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:

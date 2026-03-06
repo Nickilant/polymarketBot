@@ -24,6 +24,7 @@ class Settings:
     polymarket_markets_url: str
     polymarket_trades_url: str
     subscriptions_db: str
+    telegram_payments_provider_token: str
 
 
 def load_settings() -> Settings:
@@ -61,4 +62,5 @@ def load_settings() -> Settings:
             "POLYMARKET_TRADES_URL", "https://data-api.polymarket.com/trades"
         ),
         subscriptions_db=subscriptions_db,
+        telegram_payments_provider_token=os.getenv("TELEGRAM_PAYMENTS_PROVIDER_TOKEN", "").strip(),
     )
