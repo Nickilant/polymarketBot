@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from polymarket_bot.models import InsiderSignal, MarketView, ProbabilitySignal
@@ -72,8 +73,28 @@ class Analyzer:
         return signals[:top_n]
 
     def probability_signals(self, markets: list[MarketView], top_n: int) -> list[ProbabilitySignal]:
+        signals = self._collect_probability_signals(markets)
+        signals.sort(key=lambda x: (x.gap, x.leading_probability), reverse=True)
+        return signals[:top_n]
+
+    def hot_signals(self, markets: list[MarketView], top_n: int) -> list[ProbabilitySignal]:
+        now = datetime.now(timezone.utc)
+        deadline = now + timedelta(days=5)
+        eligible = [
+            market
+            for market in markets
+            if market.end_datetime and now <= market.end_datetime <= deadline
+        ]
+        signals = self._collect_probability_signals(eligible)
+        signals.sort(key=lambda x: (x.gap, x.leading_probability), reverse=True)
+        return signals[:top_n]
+
+    def _collect_probability_signals(self, markets: list[MarketView]) -> list[ProbabilitySignal]:
         signals: list[ProbabilitySignal] = []
+        seen_markets: set[str] = set()
         for market in markets:
+            if market.market_id in seen_markets:
+                continue
             paired = list(zip(market.outcomes, market.probabilities))
             if len(paired) < 2:
                 continue
@@ -84,8 +105,12 @@ class Analyzer:
             if lead_prob < self._probability_min_value or gap < self._probability_gap_threshold:
                 continue
 
-            name_ru = self._translator.translate(market.market_name)
             win = self._win_if_one_dollar(lead_prob)
+            if win < 0.1:
+                continue
+
+            name_ru = self._translator.translate(market.market_name)
+            seen_markets.add(market.market_id)
             signals.append(
                 ProbabilitySignal(
                     market_id=market.market_id,
@@ -96,11 +121,10 @@ class Analyzer:
                     second_probability=second_prob,
                     gap=gap,
                     win_if_1_dollar=win,
+                    market_url=market.market_url,
                 )
             )
-
-        signals.sort(key=lambda x: (x.gap, x.leading_probability), reverse=True)
-        return signals[:top_n]
+        return signals
 
     @staticmethod
     def _win_if_one_dollar(probability: float) -> float:

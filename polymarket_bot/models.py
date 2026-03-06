@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class ProbabilitySignal:
     second_probability: float
     gap: float
     win_if_1_dollar: float
+    market_url: str
 
 
 @dataclass(frozen=True)
@@ -32,3 +34,5 @@ class MarketView:
     market_name: str
     outcomes: list[str]
     probabilities: list[float]
+    market_url: str
+    end_datetime: datetime | None

@@ -65,6 +65,8 @@ class PolymarketClient:
             market_name=name,
             outcomes=outcomes,
             probabilities=prices,
+            market_url=self._parse_market_url(item),
+            end_datetime=self._parse_end_datetime(item),
         )
 
     @staticmethod
@@ -82,6 +84,76 @@ class PolymarketClient:
             except json.JSONDecodeError:
                 pass
         return []
+
+    @staticmethod
+    def _parse_market_url(item: dict[str, Any]) -> str:
+        event_slug_candidates: list[str] = []
+
+        event_slug = str(item.get("eventSlug") or "").strip().strip("/")
+        if event_slug:
+            event_slug_candidates.append(event_slug)
+
+        event = item.get("event")
+        if isinstance(event, dict):
+            slug = str(event.get("slug") or "").strip().strip("/")
+            if slug:
+                event_slug_candidates.append(slug)
+
+        events = item.get("events")
+        if isinstance(events, list):
+            for raw_event in events:
+                if not isinstance(raw_event, dict):
+                    continue
+                slug = str(raw_event.get("slug") or "").strip().strip("/")
+                if slug:
+                    event_slug_candidates.append(slug)
+                event_url = str(raw_event.get("url") or "").strip()
+                if event_url:
+                    return event_url
+
+        if event_slug_candidates:
+            return f"https://polymarket.com/event/{event_slug_candidates[0]}"
+
+        direct_url = str(item.get("url") or "").strip()
+        if direct_url:
+            return direct_url
+
+        slug = str(item.get("slug") or item.get("marketSlug") or "").strip().strip("/")
+        if slug:
+            return f"https://polymarket.com/event/{slug}"
+        return ""
+
+    @staticmethod
+    def _parse_end_datetime(item: dict[str, Any]) -> datetime | None:
+        for field in ("endDate", "end_time", "endTime", "expiresAt", "expirationTime"):
+            dt = PolymarketClient._parse_dt(item.get(field))
+            if dt:
+                return dt
+
+        event = item.get("event")
+        if isinstance(event, dict):
+            for field in ("endDate", "endTime", "end_time", "expiresAt"):
+                dt = PolymarketClient._parse_dt(event.get(field))
+                if dt:
+                    return dt
+        return None
+
+    @staticmethod
+    def _parse_dt(raw: Any) -> datetime | None:
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _parse_probabilities(self, item: dict[str, Any]) -> list[float]:
         for field in ("outcomePrices", "probabilities"):
