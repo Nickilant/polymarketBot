@@ -49,7 +49,12 @@ class PolymarketClient:
         return data if isinstance(data, list) else []
 
     def _parse_market(self, item: dict[str, Any]) -> MarketView | None:
-        market_id = str(item.get("id") or item.get("questionID") or item.get("conditionId") or "")
+        market_id = str(
+            item.get("conditionId")
+            or item.get("id")
+            or item.get("questionID")
+            or ""
+        )
         name = str(item.get("question") or item.get("title") or "").strip()
         if not market_id or not name:
             return None
@@ -62,6 +67,7 @@ class PolymarketClient:
 
         return MarketView(
             market_id=market_id,
+            condition_id=str(item.get("conditionId") or ""),
             market_name=name,
             outcomes=outcomes,
             probabilities=prices,

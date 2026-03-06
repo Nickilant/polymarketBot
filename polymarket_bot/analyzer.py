@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any
 
 from polymarket_bot.models import InsiderSignal, MarketView, ProbabilitySignal
 from polymarket_bot.translator import RuTranslator
+
+logger = logging.getLogger(__name__)
 
 
 class Analyzer:
@@ -27,60 +30,90 @@ class Analyzer:
         markets: list[MarketView],
         top_n: int,
     ) -> list[InsiderSignal]:
-        market_by_id = {m.market_id: m for m in markets}
+        market_by_id: dict[str, MarketView] = {}
+        for market in markets:
+            if market.market_id:
+                market_by_id[market.market_id] = market
+            if getattr(market, "condition_id", ""):
+                market_by_id[market.condition_id] = market
+
         market_by_name = {m.market_name.strip().lower(): m for m in markets}
-        max_trade_by_key: dict[tuple[str, str, str], float] = defaultdict(float)
-        last_trade: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        wallet_stats: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(
+            lambda: {"total_volume": 0.0, "trade_count": 0, "max_trade": 0.0, "last_trade": None}
+        )
 
         for trade in trades:
             market_id = str(
-                trade.get("market")
+                trade.get("conditionId")
+                or trade.get("market")
                 or trade.get("marketId")
-                or trade.get("conditionId")
                 or ""
             )
-            wallet = str(trade.get("maker") or trade.get("trader") or trade.get("wallet") or trade.get("proxyWallet") or "")
-            outcome = str(trade.get("outcome") or trade.get("side") or "").strip() or "N/A"
+            wallet = str(
+                trade.get("maker")
+                or trade.get("trader")
+                or trade.get("wallet")
+                or trade.get("proxyWallet")
+                or ""
+            )
+            outcome = (
+                trade.get("outcome")
+                or trade.get("side")
+                or str(trade.get("outcomeIndex"))
+                or "N/A"
+            )
+            outcome = str(outcome).strip() or "N/A"
             if not market_id or not wallet:
                 continue
-            size = self._trade_size_usd(trade)
-            if size is None:
+
+            trade_size = self._trade_size_usd(trade)
+            if trade_size is None:
                 continue
 
             key = (market_id, wallet, outcome)
-            trade_size = abs(size)
-            if trade_size >= max_trade_by_key[key]:
-                max_trade_by_key[key] = trade_size
-                last_trade[key] = trade
+            stats = wallet_stats[key]
+            stats["total_volume"] += trade_size
+            stats["trade_count"] += 1
+            if trade_size >= stats["max_trade"]:
+                stats["max_trade"] = trade_size
+                stats["last_trade"] = trade
 
         signals: list[InsiderSignal] = []
-        for key, max_trade_size in max_trade_by_key.items():
-            if max_trade_size < self._insider_min_trade_usd:
+        for key, stats in wallet_stats.items():
+            total_volume = stats["total_volume"]
+            if total_volume < self._insider_min_trade_usd:
                 continue
+
             market_id, wallet, outcome = key
             market = market_by_id.get(market_id)
-            trade = last_trade[key]
+            trade = stats["last_trade"] or {}
             if not market:
+                logger.debug("Unmatched trade market id: %s", market_id)
                 title = str(trade.get("title") or "").strip().lower()
                 if title:
                     market = market_by_name.get(title)
             if not market:
                 continue
+
             price = float(trade.get("price") or trade.get("outcomePrice") or 0.5)
             name_ru = self._translator.translate(market.market_name)
             signals.append(
                 InsiderSignal(
-                    market_id=market_id,
+                    market_id=market.market_id,
                     market_name_en=market.market_name,
                     market_name_ru=name_ru,
                     wallet=self._short_wallet(wallet),
-                    amount_usd=max_trade_size,
+                    amount_usd=stats["max_trade"],
+                    total_volume=total_volume,
+                    trade_count=stats["trade_count"],
+                    is_whale=total_volume >= 50000,
                     outcome=outcome,
                     price=price,
                 )
             )
 
-        signals.sort(key=lambda x: x.amount_usd, reverse=True)
+        signals.sort(key=lambda x: (x.total_volume, x.amount_usd, x.trade_count), reverse=True)
         return signals[:top_n]
 
     def probability_signals(self, markets: list[MarketView], top_n: int) -> list[ProbabilitySignal]:
@@ -139,20 +172,32 @@ class Analyzer:
 
     @staticmethod
     def _trade_size_usd(trade: dict[str, Any]) -> float | None:
-        raw_usdc_size = trade.get("usdcSize") or trade.get("amount")
-        if raw_usdc_size not in (None, ""):
+        for raw in (trade.get("usdcSize"), trade.get("amount")):
+            if raw in (None, ""):
+                continue
             try:
-                return abs(float(raw_usdc_size))
+                return abs(float(raw))
+            except (TypeError, ValueError):
+                continue
+
+        size_raw = trade.get("size")
+        if size_raw not in (None, ""):
+            try:
+                size = abs(float(size_raw))
             except (TypeError, ValueError):
                 return None
 
-        try:
-            size = abs(float(trade.get("size") or 0))
-            price = float(trade.get("price") or trade.get("outcomePrice") or 0)
-        except (TypeError, ValueError):
-            return None
+            price_raw = trade.get("price") or trade.get("outcomePrice")
+            if price_raw not in (None, ""):
+                try:
+                    price = float(price_raw)
+                except (TypeError, ValueError):
+                    return None
+                return size * price
 
-        return size * price if price > 0 else size
+            return size
+
+        return None
 
     @staticmethod
     def _win_if_one_dollar(probability: float) -> float:
