@@ -13,6 +13,9 @@ class InsiderSignal:
     amount_usd: float
     outcome: str
     price: float
+    total_volume: float = 0.0
+    trade_count: int = 0
+    is_whale: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,3 +39,4 @@ class MarketView:
     probabilities: list[float]
     market_url: str
     end_datetime: datetime | None
+    condition_id: str = ""
