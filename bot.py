@@ -140,6 +140,7 @@ class BotService:
         self.application.add_handler(CommandHandler("stop", self.cmd_stop))
         self.application.add_handler(CommandHandler("grant", self.cmd_grant))
         self.application.add_handler(CommandHandler("analysis", self.cmd_analysis))
+        self.application.add_handler(CommandHandler("next_analysis", self.cmd_next_analysis))
         self.application.add_handler(PreCheckoutQueryHandler(self.precheckout_callback))
         self.application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.successful_payment_callback))
 
@@ -278,6 +279,23 @@ class BotService:
         await context.bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_hot_message(hot_signals), parse_mode="HTML")
 
+    async def cmd_next_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not update.effective_chat:
+            return
+        if update.effective_user.id != self.settings.admin_chat_id:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Команда только для админа")
+            return
+
+        now = datetime.now(timezone.utc)
+        admin_sub = self.store.ensure_free(self.settings.admin_chat_id)
+        lines = [
+            "⏱ Следующее время рассылки для админа (UTC):",
+            f"Инсайдеры: {self._next_due_for_label(admin_sub, 'insider', now)}",
+            f"Вероятность: {self._next_due_for_label(admin_sub, 'probability', now)}",
+            f"Горячие: {self._next_due_for_label(admin_sub, 'hot', now)}",
+        ]
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines))
+
     async def analysis_loop(self) -> None:
         logger.info("Запущен цикл анализа. Интервал проверки инсайдеров: %s сек.", INSIDER_CHECK_INTERVAL_SECONDS)
         while True:
@@ -314,38 +332,55 @@ class BotService:
         ]
         return json.dumps(payload, ensure_ascii=False)
 
-    def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
+    def _interval_for_label(self, sub: UserSubscription, label: str) -> timedelta | None:
         if sub.user_id == self.settings.admin_chat_id:
             if label == "insider":
-                last = sub.last_sent_insider_at
-                interval = timedelta(hours=1)
-            elif label == "probability":
-                last = sub.last_sent_probability_at
-                interval = timedelta(hours=12)
-            elif label == "hot":
-                last = sub.last_sent_hot_at
-                interval = timedelta(hours=3)
-            else:
-                return False
-            return last is None or now - last >= interval
+                return timedelta(hours=1)
+            if label == "probability":
+                return timedelta(hours=12)
+            if label == "hot":
+                return timedelta(hours=3)
+            return None
 
         if sub.effective_plan() == FREE_PLAN:
-            if label != "probability":
-                return False
-            last = sub.last_sent_probability_at
-            return last is None or now - last >= timedelta(days=2)
+            if label == "probability":
+                return timedelta(days=2)
+            return None
 
         if label == "insider":
-            last = sub.last_sent_insider_at
-            interval = timedelta(hours=1)
-        elif label == "probability":
-            last = sub.last_sent_probability_at
-            interval = timedelta(hours=12)
-        elif label == "hot":
-            last = sub.last_sent_hot_at
-            interval = timedelta(hours=3)
-        else:
+            return timedelta(hours=1)
+        if label == "probability":
+            return timedelta(hours=12)
+        if label == "hot":
+            return timedelta(hours=3)
+        return None
+
+    def _last_sent_for_label(self, sub: UserSubscription, label: str) -> datetime | None:
+        if label == "insider":
+            return sub.last_sent_insider_at
+        if label == "probability":
+            return sub.last_sent_probability_at
+        if label == "hot":
+            return sub.last_sent_hot_at
+        return None
+
+    def _next_due_for_label(self, sub: UserSubscription, label: str, now: datetime) -> str:
+        interval = self._interval_for_label(sub, label)
+        if interval is None:
+            return "недоступно для текущего тарифа/режима"
+        last = self._last_sent_for_label(sub, label)
+        if last is None:
+            return "сразу при следующем цикле"
+        due_at = last + interval
+        if due_at <= now:
+            return "сразу при следующем цикле"
+        return due_at.isoformat(timespec="seconds")
+
+    def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
+        interval = self._interval_for_label(sub, label)
+        if interval is None:
             return False
+        last = self._last_sent_for_label(sub, label)
         return last is None or now - last >= interval
 
     def _mode_allows_label(self, sub: UserSubscription, label: str) -> bool:
@@ -363,6 +398,26 @@ class BotService:
         if not probability_signals:
             return
         await bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
+
+    async def _send_admin_cycle_report(
+        self,
+        now: datetime,
+        markets_count: int,
+        insider_signals_count: int,
+        probability_signals_count: int,
+        hot_signals_count: int,
+        insider_changed: bool,
+        hot_changed: bool,
+    ) -> None:
+        report = (
+            "🧪 Короткий отчёт анализа\n"
+            f"UTC: {now.isoformat(timespec='seconds')}\n"
+            f"Рынков: {markets_count}\n"
+            f"Инсайдеры: {insider_signals_count} ({'изменились' if insider_changed else 'без изменений'})\n"
+            f"Вероятность: {probability_signals_count}\n"
+            f"Горячие: {hot_signals_count} ({'изменились' if hot_changed else 'без изменений'})"
+        )
+        await self.sender.send_to(self.settings.admin_chat_id, report)
 
     async def _run_cycle(self, now: datetime) -> None:
         self.store.ensure_free(self.settings.admin_chat_id)
@@ -404,6 +459,16 @@ class BotService:
             "probability": format_probability_message(probability_signals),
             "hot": format_hot_message(hot_signals),
         }
+
+        await self._send_admin_cycle_report(
+            now=now,
+            markets_count=len(markets),
+            insider_signals_count=len(insider_signals),
+            probability_signals_count=len(probability_signals),
+            hot_signals_count=len(hot_signals),
+            insider_changed=insider_changed,
+            hot_changed=hot_changed,
+        )
 
         for user_id, days, paid_until in self.store.due_renewal_reminders(now):
             reminder_text = (
@@ -491,7 +556,7 @@ class BotService:
             f"Интервал цикла: {self.settings.polling_interval_seconds} сек.\n\n"
             "Справка по командам:\n"
             f"{welcome_text()}\n\n"
-            "Админ-команда: /analysis — показать последние данные анализа."
+            "Админ-команды: /analysis — последние данные, /next_analysis — время следующей рассылки по видам анализа."
         )
         await self.sender.send_to(self.settings.admin_chat_id, startup_text)
 
