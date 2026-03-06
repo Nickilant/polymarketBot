@@ -24,6 +24,8 @@ class UserSubscription:
     is_active: bool = True
     remind_7_for: str | None = None
     remind_3_for: str | None = None
+    hot_sent_market_ids: str | None = None
+    hot_sent_reset_at: datetime | None = None
 
     def effective_plan(self) -> str:
         if self.plan == PRO_PLAN and self.paid_until and self.paid_until > datetime.now(timezone.utc):
@@ -52,11 +54,21 @@ class SubscriptionStore:
                 paid_until TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 remind_7_for TEXT,
-                remind_3_for TEXT
+                remind_3_for TEXT,
+                hot_sent_market_ids TEXT,
+                hot_sent_reset_at TEXT
             )
             """
         )
         self._ensure_columns()
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
         self._conn.commit()
 
     def _ensure_columns(self) -> None:
@@ -73,6 +85,10 @@ class SubscriptionStore:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN last_sent_probability_at TEXT")
         if "last_sent_hot_at" not in columns:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN last_sent_hot_at TEXT")
+        if "hot_sent_market_ids" not in columns:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN hot_sent_market_ids TEXT")
+        if "hot_sent_reset_at" not in columns:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN hot_sent_reset_at TEXT")
 
     def _row_to_sub(self, row: sqlite3.Row) -> UserSubscription:
         return UserSubscription(
@@ -88,6 +104,8 @@ class SubscriptionStore:
             is_active=bool(row["is_active"]),
             remind_7_for=row["remind_7_for"],
             remind_3_for=row["remind_3_for"],
+            hot_sent_market_ids=row["hot_sent_market_ids"],
+            hot_sent_reset_at=_parse_dt(row["hot_sent_reset_at"]),
         )
 
     def get(self, user_id: int) -> UserSubscription | None:
@@ -115,11 +133,11 @@ class SubscriptionStore:
             INSERT INTO subscriptions (
                 user_id, plan, mode, created_at, last_sent_at,
                 last_sent_insider_at, last_sent_probability_at, last_sent_hot_at,
-                paid_until, is_active, remind_7_for, remind_3_for
+                paid_until, is_active, remind_7_for, remind_3_for, hot_sent_market_ids, hot_sent_reset_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, FREE_PLAN, "both", _dump_dt(now), None, None, None, None, None, 1, None, None),
+            (user_id, FREE_PLAN, "both", _dump_dt(now), None, None, None, None, None, 1, None, None, None, None),
         )
         self._conn.commit()
         return self.get(user_id)  # type: ignore[return-value]
@@ -195,6 +213,42 @@ class SubscriptionStore:
                 "UPDATE subscriptions SET remind_3_for = ? WHERE user_id = ?",
                 (paid_until_iso, user_id),
             )
+        self._conn.commit()
+
+
+    def replace_hot_progress(self, user_id: int, market_ids: list[str], reset_at: datetime) -> None:
+        serialized = ",".join(market_ids) if market_ids else None
+        self._conn.execute(
+            "UPDATE subscriptions SET hot_sent_market_ids = ?, hot_sent_reset_at = ? WHERE user_id = ?",
+            (serialized, _dump_dt(reset_at), user_id),
+        )
+        self._conn.commit()
+
+    def get_global_hot_progress(self) -> tuple[list[str], datetime | None]:
+        row = self._conn.execute(
+            "SELECT value FROM bot_state WHERE key = ?",
+            ("hot_sent_market_ids",),
+        ).fetchone()
+        ids_raw = row[0] if row else None
+        sent_ids = [item for item in str(ids_raw).split(",") if item] if ids_raw else []
+
+        row = self._conn.execute(
+            "SELECT value FROM bot_state WHERE key = ?",
+            ("hot_sent_reset_at",),
+        ).fetchone()
+        reset_at = _parse_dt(row[0]) if row and row[0] else None
+        return sent_ids, reset_at
+
+    def set_global_hot_progress(self, market_ids: list[str], reset_at: datetime) -> None:
+        serialized = ",".join(market_ids) if market_ids else ""
+        self._conn.execute(
+            "INSERT INTO bot_state(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("hot_sent_market_ids", serialized),
+        )
+        self._conn.execute(
+            "INSERT INTO bot_state(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("hot_sent_reset_at", _dump_dt(reset_at) or ""),
+        )
         self._conn.commit()
 
     def mark_sent(self, user_id: int, label: str, sent_at: datetime) -> None:
