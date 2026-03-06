@@ -16,6 +16,7 @@ class InsiderSignal:
     total_volume: float = 0.0
     trade_count: int = 0
     is_whale: bool = False
+    market_url: str = ""
 
 
 @dataclass(frozen=True)

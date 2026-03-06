@@ -49,20 +49,24 @@ def format_insider_message(signals: list[InsiderSignal]) -> str:
         price = max(0.01, min(0.99, signal.price))
         profit = (1.0 / price) - 1.0
         whale_label = "🐋 Whale" if signal.is_whale else ""
+        safe_name = html.escape(signal.market_name_ru)
+        safe_wallet = html.escape(signal.wallet)
+        safe_outcome = html.escape(signal.outcome)
         lines.append(
             (
-                f"{idx}) {signal.market_name_ru}\n"
-                f"Кошелёк: {signal.wallet} | Исход: {signal.outcome}\n"
+                f"{idx}) {safe_name}\n"
+                f"Кошелёк: {safe_wallet} | Исход: {safe_outcome} ({price * 100:.1f}%)\n"
                 f"Крупнейшая ставка: ${signal.amount_usd:,.0f} | Общий объём: ${signal.total_volume:,.0f}\n"
-                f"Сделок: {signal.trade_count} | Цена входа: {price * 100:.1f}% | Профит с $1: ${profit:.2f} {whale_label}".strip()
+                f"Сделок: {signal.trade_count} | Цена входа: {price * 100:.1f}% | Профит с $1: ${profit:.2f} {whale_label}\n"
+                f"{_format_market_link(signal.market_url)}"
             )
         )
     return "\n\n".join(lines)
 
 
-def _format_link(signal: ProbabilitySignal) -> str:
-    safe_url = html.escape(signal.market_url, quote=True)
-    return f"<a href=\"{safe_url}\">ссылка на маркет</a>" if signal.market_url else "ссылка на маркет: недоступна"
+def _format_market_link(market_url: str) -> str:
+    safe_url = html.escape(market_url, quote=True)
+    return f"<a href=\"{safe_url}\">ссылка на маркет</a>" if market_url else "ссылка на маркет: недоступна"
 
 
 def format_probability_message(signals: list[ProbabilitySignal]) -> str:
@@ -79,7 +83,7 @@ def format_probability_message(signals: list[ProbabilitySignal]) -> str:
                 f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
                 f" | Отрыв: {signal.gap * 100:.1f}%\n"
                 f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
-                f"{_format_link(signal)}"
+                f"{_format_market_link(signal.market_url)}"
             )
         )
     return "\n\n".join(lines)
@@ -99,7 +103,7 @@ def format_hot_message(signals: list[ProbabilitySignal]) -> str:
                 f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
                 f" | Отрыв: {signal.gap * 100:.1f}%\n"
                 f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
-                f"{_format_link(signal)}"
+                f"{_format_market_link(signal.market_url)}"
             )
         )
     return "\n\n".join(lines)
@@ -283,7 +287,7 @@ class BotService:
         probability_signals = [ProbabilitySignal(**raw) for raw in payload.get("probability_signals", [])]
         hot_signals = [ProbabilitySignal(**raw) for raw in payload.get("hot_signals", [])]
 
-        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals))
+        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals), parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_hot_message(hot_signals), parse_mode="HTML")
 
@@ -600,7 +604,7 @@ class BotService:
                 if label == "insider" and not insider_signals:
                     continue
 
-                parse_mode = "HTML" if label in {"probability", "hot"} else None
+                parse_mode = "HTML" if label in {"insider", "probability", "hot"} else None
                 if label == "hot" and not messages["hot"]:
                     continue
 
