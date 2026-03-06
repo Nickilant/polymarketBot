@@ -110,6 +110,7 @@ class Analyzer:
                     is_whale=total_volume >= 50000,
                     outcome=outcome,
                     price=price,
+                    market_url=market.market_url,
                 )
             )
 
