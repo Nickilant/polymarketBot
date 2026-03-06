@@ -26,6 +26,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("polymarket-telegram-bot")
 
+INSIDER_CHECK_INTERVAL_SECONDS = 600
+
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
     lines = ["🕵️ Инсайдерская торговля (топ-3):"]
@@ -91,7 +93,7 @@ def welcome_text() -> str:
     return (
         "Привет! Я бот с сигналами Polymarket.\n\n"
         "Что отправляю:\n"
-        "• Инсайдерские сделки — проверка каждый час, отправляю только когда есть сделки.\n"
+        "• Инсайдерские сделки — проверка каждые 10 минут; отправляю только при новых данных.\n"
         "• Высокая вероятность — 2 раза в день (Pro).\n"
         "• Горячие ставки — раз в 3 часа, только если есть изменения (Pro).\n"
         "• Бесплатный тариф: только высокая вероятность 1 раз в 2 дня.\n\n"
@@ -205,7 +207,7 @@ class BotService:
         ))
 
     async def analysis_loop(self) -> None:
-        logger.info("Запущен цикл анализа. Интервал опроса: %s сек.", self.settings.polling_interval_seconds)
+        logger.info("Запущен цикл анализа. Интервал проверки инсайдеров: %s сек.", INSIDER_CHECK_INTERVAL_SECONDS)
         while True:
             now = datetime.now(timezone.utc)
             try:
@@ -213,7 +215,7 @@ class BotService:
                 await self._run_cycle(now)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Ошибка в цикле анализа: %s", exc)
-            await asyncio.sleep(self.settings.polling_interval_seconds)
+            await asyncio.sleep(INSIDER_CHECK_INTERVAL_SECONDS)
 
     async def _maybe_send_admin_heartbeat(self, now: datetime) -> None:
         if self._last_admin_heartbeat_sent and (now - self._last_admin_heartbeat_sent).total_seconds() < 3600:
@@ -231,6 +233,13 @@ class BotService:
 
     def _hot_signature(self, signals: list[ProbabilitySignal]) -> str:
         payload = [(s.market_id, s.leading_outcome, round(s.leading_probability, 4), round(s.gap, 4)) for s in signals]
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _insider_signature(self, signals: list[InsiderSignal]) -> str:
+        payload = [
+            (s.market_id, s.wallet, s.outcome, round(s.amount_usd, 2), round(s.price, 4))
+            for s in signals
+        ]
         return json.dumps(payload, ensure_ascii=False)
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
@@ -276,10 +285,21 @@ class BotService:
 
         previous_snapshot = await self._load_analysis_snapshot() or {}
         previous_hot_signature = str(previous_snapshot.get("hot_signature") or "")
+        previous_insider_signature = str(previous_snapshot.get("insider_signature") or "")
         hot_signature = self._hot_signature(hot_signals)
+        insider_signature = self._insider_signature(insider_signals)
         hot_changed = hot_signature != previous_hot_signature
+        insider_changed = insider_signature != previous_insider_signature
 
-        await self._save_analysis_snapshot(now, markets, insider_signals, probability_signals, hot_signals, hot_signature)
+        await self._save_analysis_snapshot(
+            now,
+            markets,
+            insider_signals,
+            probability_signals,
+            hot_signals,
+            hot_signature,
+            insider_signature,
+        )
 
         messages = {
             "insider": format_insider_message(insider_signals) if insider_signals else "",
@@ -305,7 +325,7 @@ class BotService:
                     continue
                 if not self._is_due(sub, label, now):
                     continue
-                if label == "insider" and not insider_signals:
+                if label == "insider" and (not insider_signals or not insider_changed):
                     continue
                 if label == "hot" and not hot_changed:
                     continue
@@ -325,6 +345,7 @@ class BotService:
         probability_signals: list[ProbabilitySignal],
         hot_signals: list[ProbabilitySignal],
         hot_signature: str,
+        insider_signature: str,
     ) -> None:
         payload = {
             "generated_at": now.isoformat(timespec="seconds"),
@@ -333,6 +354,7 @@ class BotService:
             "probability_signals_count": len(probability_signals),
             "hot_signals_count": len(hot_signals),
             "hot_signature": hot_signature,
+            "insider_signature": insider_signature,
             "insider_signals": [signal.__dict__ for signal in insider_signals],
             "probability_signals": [signal.__dict__ for signal in probability_signals],
             "hot_signals": [signal.__dict__ for signal in hot_signals],
