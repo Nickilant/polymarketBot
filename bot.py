@@ -146,8 +146,11 @@ class BotService:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
             return
+        existing_sub = self.store.get(update.effective_user.id)
         self.store.ensure_free(update.effective_user.id)
         await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_text())
+        if existing_sub is None:
+            await self._send_latest_probability_signals(update.effective_chat.id, context.bot)
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
@@ -257,7 +260,8 @@ class BotService:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="Анализ ещё не запускался.")
             return
 
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=(
+        chat_id = update.effective_chat.id
+        await context.bot.send_message(chat_id=chat_id, text=(
             "🧾 Последние данные анализа\n"
             f"Время UTC: {payload.get('generated_at', '-')}\n"
             f"Рынков: {payload.get('markets_count', 0)}\n"
@@ -265,6 +269,14 @@ class BotService:
             f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}\n"
             f"Горячих сигналов: {payload.get('hot_signals_count', 0)}"
         ))
+
+        insider_signals = [InsiderSignal(**raw) for raw in payload.get("insider_signals", [])]
+        probability_signals = [ProbabilitySignal(**raw) for raw in payload.get("probability_signals", [])]
+        hot_signals = [ProbabilitySignal(**raw) for raw in payload.get("hot_signals", [])]
+
+        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals) if insider_signals else "🕵️ Инсайдерская торговля: сигналов нет.")
+        await context.bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
+        await context.bot.send_message(chat_id=chat_id, text=format_hot_message(hot_signals), parse_mode="HTML")
 
     async def analysis_loop(self) -> None:
         logger.info("Запущен цикл анализа. Интервал проверки инсайдеров: %s сек.", INSIDER_CHECK_INTERVAL_SECONDS)
@@ -303,6 +315,20 @@ class BotService:
         return json.dumps(payload, ensure_ascii=False)
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
+        if sub.user_id == self.settings.admin_chat_id:
+            if label == "insider":
+                last = sub.last_sent_insider_at
+                interval = timedelta(hours=1)
+            elif label == "probability":
+                last = sub.last_sent_probability_at
+                interval = timedelta(hours=12)
+            elif label == "hot":
+                last = sub.last_sent_hot_at
+                interval = timedelta(hours=3)
+            else:
+                return False
+            return last is None or now - last >= interval
+
         if sub.effective_plan() == FREE_PLAN:
             if label != "probability":
                 return False
@@ -323,11 +349,23 @@ class BotService:
         return last is None or now - last >= interval
 
     def _mode_allows_label(self, sub: UserSubscription, label: str) -> bool:
+        if sub.user_id == self.settings.admin_chat_id:
+            return True
         if sub.effective_plan() == FREE_PLAN:
             return label == "probability"
         return sub.mode in {label, "both"}
 
+    async def _send_latest_probability_signals(self, chat_id: int, bot: Any) -> None:
+        payload = await self._load_analysis_snapshot()
+        if not payload:
+            return
+        probability_signals = [ProbabilitySignal(**raw) for raw in payload.get("probability_signals", [])]
+        if not probability_signals:
+            return
+        await bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
+
     async def _run_cycle(self, now: datetime) -> None:
+        self.store.ensure_free(self.settings.admin_chat_id)
         markets = await self.client.fetch_markets()
         insider_signals: list[InsiderSignal] = []
         probability_signals: list[ProbabilitySignal] = []
