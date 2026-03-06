@@ -41,15 +41,20 @@ PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
 
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
-    lines = ["💰 Крупные ставки (топ-3):"]
+    if not signals:
+        return "💰 Крупные ставки: сигналов нет."
+
+    lines = [f"💰 Крупные ставки (топ-{len(signals)}):"]
     for idx, signal in enumerate(signals, start=1):
         price = max(0.01, min(0.99, signal.price))
         profit = (1.0 / price) - 1.0
+        whale_label = "🐋 Whale" if signal.is_whale else ""
         lines.append(
             (
                 f"{idx}) {signal.market_name_ru}\n"
                 f"Кошелёк: {signal.wallet} | Исход: {signal.outcome}\n"
-                f"Объём: ${signal.amount_usd:,.0f} | Профит с $1: ${profit:.2f}"
+                f"Крупнейшая ставка: ${signal.amount_usd:,.0f} | Общий объём: ${signal.total_volume:,.0f}\n"
+                f"Сделок: {signal.trade_count} | Цена входа: {price * 100:.1f}% | Профит с $1: ${profit:.2f} {whale_label}".strip()
             )
         )
     return "\n\n".join(lines)
@@ -278,7 +283,7 @@ class BotService:
         probability_signals = [ProbabilitySignal(**raw) for raw in payload.get("probability_signals", [])]
         hot_signals = [ProbabilitySignal(**raw) for raw in payload.get("hot_signals", [])]
 
-        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals) if insider_signals else "💰 Крупные ставки: сигналов нет.")
+        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals))
         await context.bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_hot_message(hot_signals), parse_mode="HTML")
 
@@ -552,7 +557,7 @@ class BotService:
 
         selected_hot_signal = self._pick_next_hot_signal(hot_signals, now) if hot_due else None
         messages = {
-            "insider": format_insider_message(insider_signals) if insider_signals else "",
+            "insider": format_insider_message(insider_signals),
             "probability": format_probability_message(probability_signals),
             "hot": format_hot_message([selected_hot_signal]) if selected_hot_signal else "",
         }
