@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 FREE_PLAN = "free"
 PRO_PLAN = "pro150"
-VALID_MODES = {"insider", "probability", "both"}
+VALID_MODES = {"insider", "probability", "hot", "both"}
 
 
 @dataclass
@@ -113,7 +113,7 @@ class SubscriptionStore:
 
     def set_mode(self, user_id: int, mode: str) -> UserSubscription:
         if mode not in VALID_MODES:
-            raise ValueError("mode must be insider/probability/both")
+            raise ValueError("mode must be insider/probability/hot/both")
         self.ensure_free(user_id)
         self._conn.execute(
             "UPDATE subscriptions SET mode = ? WHERE user_id = ?",

@@ -18,6 +18,7 @@ class Settings:
     insider_min_trade_usd: float
     insider_top_n: int
     probability_top_n: int
+    hot_top_n: int
     probability_gap_threshold: float
     probability_min_value: float
     polymarket_markets_url: str
@@ -35,8 +36,8 @@ def load_settings() -> Settings:
         raise ValueError("ADMIN_CHAT_ID is required")
 
     mode = os.getenv("ANALYSIS_MODE", "both").strip().lower()
-    if mode not in {"insider", "probability", "both"}:
-        raise ValueError("ANALYSIS_MODE must be one of: insider, probability, both")
+    if mode not in {"insider", "probability", "hot", "both"}:
+        raise ValueError("ANALYSIS_MODE must be one of: insider, probability, hot, both")
 
     base_dir = Path(__file__).resolve().parent.parent
     env_db = os.getenv("SUBSCRIPTIONS_DB", "").strip() or os.getenv("SUBSCRIPTIONS_FILE", "").strip()
@@ -50,6 +51,7 @@ def load_settings() -> Settings:
         insider_min_trade_usd=float(os.getenv("INSIDER_MIN_TRADE_USD", "5000")),
         insider_top_n=int(os.getenv("INSIDER_TOP_N", "3")),
         probability_top_n=int(os.getenv("PROBABILITY_TOP_N", "10")),
+        hot_top_n=int(os.getenv("HOT_TOP_N", "10")),
         probability_gap_threshold=float(os.getenv("PROBABILITY_GAP_THRESHOLD", "0.35")),
         probability_min_value=float(os.getenv("PROBABILITY_MIN_VALUE", "0.7")),
         polymarket_markets_url=os.getenv(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -34,3 +35,4 @@ class MarketView:
     outcomes: list[str]
     probabilities: list[float]
     market_url: str
+    end_datetime: datetime | None

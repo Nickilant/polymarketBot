@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from polymarket_bot.analyzer import Analyzer
 from polymarket_bot.config import Settings, load_settings
-from polymarket_bot.models import InsiderSignal, ProbabilitySignal
+from polymarket_bot.models import InsiderSignal, MarketView, ProbabilitySignal
 from polymarket_bot.polymarket_client import PolymarketClient
 from polymarket_bot.subscriptions import PRO_PLAN, SubscriptionStore, VALID_MODES
 from polymarket_bot.telegram_sender import TelegramSender
@@ -45,6 +45,11 @@ def format_insider_message(signals: list[InsiderSignal]) -> str:
     return "\n\n".join(lines)
 
 
+def _format_link(signal: ProbabilitySignal) -> str:
+    safe_url = html.escape(signal.market_url, quote=True)
+    return f"<a href=\"{safe_url}\">ссылка на маркет</a>" if signal.market_url else "ссылка на маркет: недоступна"
+
+
 def format_probability_message(signals: list[ProbabilitySignal]) -> str:
     if not signals:
         return "📈 Высокая вероятность: подходящих рынков сейчас нет."
@@ -53,15 +58,33 @@ def format_probability_message(signals: list[ProbabilitySignal]) -> str:
     for idx, signal in enumerate(signals, start=1):
         safe_name = html.escape(signal.market_name_ru)
         safe_outcome = html.escape(signal.leading_outcome)
-        safe_url = html.escape(signal.market_url, quote=True)
-        link_line = f"<a href=\"{safe_url}\">ссылка на маркет</a>" if signal.market_url else "ссылка на маркет: недоступна"
         lines.append(
             (
                 f"{idx}) {safe_name}\n"
                 f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
                 f" | Отрыв: {signal.gap * 100:.1f}%\n"
                 f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
-                f"{link_line}"
+                f"{_format_link(signal)}"
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def format_hot_message(signals: list[ProbabilitySignal]) -> str:
+    if not signals:
+        return "🔥 Горячие ставки: подходящих рынков сейчас нет."
+
+    lines = ["🔥 Горячие ставки (закрытие в ближайшие 5 дней):"]
+    for idx, signal in enumerate(signals, start=1):
+        safe_name = html.escape(signal.market_name_ru)
+        safe_outcome = html.escape(signal.leading_outcome)
+        lines.append(
+            (
+                f"{idx}) {safe_name}\n"
+                f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
+                f" | Отрыв: {signal.gap * 100:.1f}%\n"
+                f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
+                f"{_format_link(signal)}"
             )
         )
     return "\n\n".join(lines)
@@ -73,12 +96,13 @@ def welcome_text() -> str:
         "Что отправляю:\n"
         "• Инсайдерские сделки (крупные входы кошельков).\n"
         "• Высоковероятные рынки (сильный отрыв лидера).\n"
+        "• Горячие ставки (рынки, которые закроются в ближайшие 5 дней).\n"
         "• В каждом сигнале есть профит при ставке $1.\n\n"
         "Тарифы:\n"
         "• Free — активируется автоматически после /start, 1 раз в день.\n"
         "• Pro150 — 150 Telegram Stars за 30 дней, сигналы каждый час.\n\n"
         "Покупка Stars: @PremiumBot\n"
-        "Команды: /mode insider|probability|both, /my, /buy, /stop"
+        "Команды: /mode insider|probability|hot|both, /my, /buy, /stop"
     )
 
 
@@ -120,11 +144,11 @@ class BotService:
         if not update.effective_user or not update.effective_chat:
             return
         if not context.args:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Используй: /mode insider|probability|both")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Используй: /mode insider|probability|hot|both")
             return
         mode = context.args[0].strip().lower()
         if mode not in VALID_MODES:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Допустимо: insider, probability, both")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Допустимо: insider, probability, hot, both")
             return
         self.store.set_mode(update.effective_user.id, mode)
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Режим обновлён: {mode}")
@@ -194,21 +218,29 @@ class BotService:
             chat_id=update.effective_chat.id,
             text=(
                 "🧾 Последние данные анализа\n"
-                f"Время UTC: {payload.get('generated_at', '-') }\n"
+                f"Время UTC: {payload.get('generated_at', '-')}\n"
                 f"Рынков: {payload.get('markets_count', 0)}\n"
                 f"Инсайдерских сигналов: {payload.get('insider_signals_count', 0)}\n"
-                f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}"
+                f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}\n"
+                f"Горячих сигналов: {payload.get('hot_signals_count', 0)}"
             ),
         )
-        if self.settings.analysis_mode in {"insider", "both"}:
+        if self._analysis_enabled("insider"):
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=format_insider_message(self._restore_insider_signals(payload.get("insider_signals", []))),
             )
-        if self.settings.analysis_mode in {"probability", "both"}:
+        if self._analysis_enabled("probability"):
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=format_probability_message(self._restore_probability_signals(payload.get("probability_signals", []))),
+                disable_web_page_preview=True,
+                parse_mode="HTML",
+            )
+        if self._analysis_enabled("hot"):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=format_hot_message(self._restore_probability_signals(payload.get("hot_signals", []))),
                 disable_web_page_preview=True,
                 parse_mode="HTML",
             )
@@ -237,35 +269,65 @@ class BotService:
         await self.sender.send_to(self.settings.admin_chat_id, heartbeat_text)
         self._last_admin_heartbeat_sent = now
 
+    def _analysis_enabled(self, option: str) -> bool:
+        if self.settings.analysis_mode == "both":
+            return True
+        return self.settings.analysis_mode == option
+
     async def _run_cycle(self, now: datetime) -> None:
         logger.info("Старт цикла анализа за %s", now.isoformat(timespec="seconds"))
         logger.info("Запрашиваю рынки Polymarket")
         markets = await self.client.fetch_markets()
         logger.info("Получено рынков: %s", len(markets))
+
         insider_signals: list[InsiderSignal] = []
         probability_signals: list[ProbabilitySignal] = []
+        hot_signals: list[ProbabilitySignal] = []
 
-        if self.settings.analysis_mode in {"insider", "both"}:
+        if self._analysis_enabled("insider"):
             logger.info("Режим включает инсайдерский анализ — загружаю последние сделки")
             trades = await self.client.fetch_recent_trades()
-            insider_signals = self.analyzer.insider_signals(trades, markets, top_n=self.settings.insider_top_n)
+            insider_signals = await asyncio.to_thread(
+                self.analyzer.insider_signals,
+                trades,
+                markets,
+                self.settings.insider_top_n,
+            )
             logger.info("Найдено инсайдерских сигналов: %s", len(insider_signals))
 
-        if self.settings.analysis_mode in {"probability", "both"}:
+        if self._analysis_enabled("probability"):
             logger.info("Режим включает анализ вероятностей — строю сигналы")
-            probability_signals = self.analyzer.probability_signals(markets, top_n=self.settings.probability_top_n)
+            probability_signals = await asyncio.to_thread(
+                self.analyzer.probability_signals,
+                markets,
+                self.settings.probability_top_n,
+            )
             logger.info("Найдено сигналов высокой вероятности: %s", len(probability_signals))
 
-        await self._save_analysis_snapshot(now, markets, insider_signals, probability_signals)
+        if self._analysis_enabled("hot"):
+            logger.info("Режим включает анализ горячих ставок — строю сигналы")
+            hot_signals = await asyncio.to_thread(
+                self.analyzer.hot_signals,
+                markets,
+                self.settings.hot_top_n,
+            )
+            logger.info("Найдено горячих сигналов: %s", len(hot_signals))
+
+        await self._save_analysis_snapshot(now, markets, insider_signals, probability_signals, hot_signals)
 
         insider_text = format_insider_message(insider_signals)
         probability_text = format_probability_message(probability_signals)
+        hot_text = format_hot_message(hot_signals)
 
         sent_labels: set[tuple[int, str]] = set()
 
-        logger.info("Отправляю оба отчёта админу %s", self.settings.admin_chat_id)
-        await self._send_unique(self.settings.admin_chat_id, "insider", insider_text, sent_labels)
-        await self._send_unique(self.settings.admin_chat_id, "probability", probability_text, sent_labels)
+        logger.info("Отправляю отчёты админу %s", self.settings.admin_chat_id)
+        if self._analysis_enabled("insider"):
+            await self._send_unique(self.settings.admin_chat_id, "insider", insider_text, sent_labels)
+        if self._analysis_enabled("probability"):
+            await self._send_unique(self.settings.admin_chat_id, "probability", probability_text, sent_labels)
+        if self._analysis_enabled("hot"):
+            await self._send_unique(self.settings.admin_chat_id, "hot", hot_text, sent_labels)
 
         reminder_count = 0
         for user_id, days, paid_until in self.store.due_renewal_reminders(now):
@@ -287,11 +349,15 @@ class BotService:
         for sub in self.store.active_users_due(now):
             if sub.user_id == self.settings.admin_chat_id:
                 continue
+
             messages: list[tuple[str, str]] = []
-            if sub.mode in {"insider", "both"} and self.settings.analysis_mode in {"insider", "both"}:
+            if sub.mode in {"insider", "both"} and self._analysis_enabled("insider"):
                 messages.append(("insider", insider_text))
-            if sub.mode in {"probability", "both"} and self.settings.analysis_mode in {"probability", "both"}:
+            if sub.mode in {"probability", "both"} and self._analysis_enabled("probability"):
                 messages.append(("probability", probability_text))
+            if sub.mode in {"hot", "both"} and self._analysis_enabled("hot"):
+                messages.append(("hot", hot_text))
+
             if not messages:
                 continue
             for label, message in messages:
@@ -305,24 +371,27 @@ class BotService:
         key = (chat_id, label)
         if key in sent_labels:
             return
-        parse_mode = "HTML" if label == "probability" else None
+        parse_mode = "HTML" if label in {"probability", "hot"} else None
         await self.sender.send_to(chat_id, text, parse_mode=parse_mode)
         sent_labels.add(key)
 
     async def _save_analysis_snapshot(
         self,
         now: datetime,
-        markets: list[Any],
+        markets: list[MarketView],
         insider_signals: list[InsiderSignal],
         probability_signals: list[ProbabilitySignal],
+        hot_signals: list[ProbabilitySignal],
     ) -> None:
         payload = {
             "generated_at": now.isoformat(timespec="seconds"),
             "markets_count": len(markets),
             "insider_signals_count": len(insider_signals),
             "probability_signals_count": len(probability_signals),
+            "hot_signals_count": len(hot_signals),
             "insider_signals": [signal.__dict__ for signal in insider_signals],
             "probability_signals": [signal.__dict__ for signal in probability_signals],
+            "hot_signals": [signal.__dict__ for signal in hot_signals],
         }
         async with self._analysis_lock:
             self._analysis_cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -351,7 +420,7 @@ class BotService:
         logger.info("Запускаю Telegram-приложение")
         await self.application.start()
         logger.info("Включаю long polling")
-        await self.application.updater.start_polling()
+        await self.application.updater.start_polling(drop_pending_updates=True)
         await self._send_startup_message_to_admin()
         analysis_task = asyncio.create_task(self.analysis_loop(), name="analysis-loop")
         try:
