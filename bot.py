@@ -381,12 +381,17 @@ class BotService:
         interval = self._interval_for_label(sub, label)
         if interval is None:
             return "недоступно для текущего тарифа/режима"
+        analysis_due_at = self._next_analysis_due_at(label, now)
         last = self._last_sent_for_label(sub, label)
         if last is None:
-            return "сразу при следующем цикле"
+            if analysis_due_at is None:
+                return "сразу при следующем цикле"
+            return analysis_due_at.isoformat(timespec="seconds")
         due_at = last + interval
+        if analysis_due_at is not None and analysis_due_at > due_at:
+            due_at = analysis_due_at
         if due_at <= now:
-            return "сразу при следующем цикле"
+            return now.isoformat(timespec="seconds")
         return due_at.isoformat(timespec="seconds")
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
@@ -404,6 +409,12 @@ class BotService:
         return sub.mode in {label, "both"}
 
     def _is_analysis_due(self, label: str, now: datetime) -> bool:
+        due_at = self._next_analysis_due_at(label, now)
+        if due_at is None:
+            return False
+        return due_at <= now
+
+    def _next_analysis_due_at(self, label: str, now: datetime) -> datetime | None:
         if label == "insider":
             last = self._last_insider_analysis_at
             interval = INSIDER_ANALYSIS_INTERVAL
@@ -414,8 +425,10 @@ class BotService:
             last = self._last_hot_analysis_at
             interval = HOT_ANALYSIS_INTERVAL
         else:
-            return False
-        return last is None or now - last >= interval
+            return None
+        if last is None:
+            return now
+        return last + interval
 
     async def _notify_admin_analysis_started(self, label: str, now: datetime) -> None:
         labels = {
@@ -562,7 +575,7 @@ class BotService:
 
         due_by_label = {"insider": insider_due, "probability": probability_due, "hot": hot_due}
         for label, count in sent_by_label.items():
-            if due_by_label[label]:
+            if due_by_label[label] and count > 0:
                 await self._notify_admin_distribution(label, count, now)
 
         logger.info("Цикл завершён. Пользователей, получивших рассылку: %s", len(sent_users))
