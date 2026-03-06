@@ -49,7 +49,7 @@ def load_settings() -> Settings:
         admin_chat_id=int(admin_chat_id),
         analysis_mode=mode,
         polling_interval_seconds=int(os.getenv("POLLING_INTERVAL_SECONDS", "3600")),
-        insider_min_trade_usd=float(os.getenv("INSIDER_MIN_TRADE_USD", "5000")),
+        insider_min_trade_usd=float(os.getenv("INSIDER_MIN_TRADE_USD", "1000")),
         insider_top_n=int(os.getenv("INSIDER_TOP_N", "3")),
         probability_top_n=int(os.getenv("PROBABILITY_TOP_N", "10")),
         hot_top_n=int(os.getenv("HOT_TOP_N", "10")),

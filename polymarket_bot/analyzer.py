@@ -28,7 +28,7 @@ class Analyzer:
         top_n: int,
     ) -> list[InsiderSignal]:
         market_by_id = {m.market_id: m for m in markets}
-        aggregate: dict[tuple[str, str, str], float] = defaultdict(float)
+        max_trade_by_key: dict[tuple[str, str, str], float] = defaultdict(float)
         last_trade: dict[tuple[str, str, str], dict[str, Any]] = {}
 
         for trade in trades:
@@ -43,12 +43,14 @@ class Analyzer:
                 continue
 
             key = (market_id, wallet, outcome)
-            aggregate[key] += abs(size)
-            last_trade[key] = trade
+            trade_size = abs(size)
+            if trade_size >= max_trade_by_key[key]:
+                max_trade_by_key[key] = trade_size
+                last_trade[key] = trade
 
         signals: list[InsiderSignal] = []
-        for key, total in aggregate.items():
-            if total < self._insider_min_trade_usd:
+        for key, max_trade_size in max_trade_by_key.items():
+            if max_trade_size < self._insider_min_trade_usd:
                 continue
             market_id, wallet, outcome = key
             market = market_by_id.get(market_id)
@@ -63,7 +65,7 @@ class Analyzer:
                     market_name_en=market.market_name,
                     market_name_ru=name_ru,
                     wallet=self._short_wallet(wallet),
-                    amount_usd=total,
+                    amount_usd=max_trade_size,
                     outcome=outcome,
                     price=price,
                 )
