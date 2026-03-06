@@ -4,7 +4,7 @@ import asyncio
 import html
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,7 @@ from polymarket_bot.analyzer import Analyzer
 from polymarket_bot.config import Settings, load_settings
 from polymarket_bot.models import InsiderSignal, MarketView, ProbabilitySignal
 from polymarket_bot.polymarket_client import PolymarketClient
-from polymarket_bot.subscriptions import PRO_PLAN, SubscriptionStore, VALID_MODES
+from polymarket_bot.subscriptions import FREE_PLAN, PRO_PLAN, SubscriptionStore, UserSubscription, VALID_MODES
 from polymarket_bot.telegram_sender import TelegramSender
 from polymarket_bot.translator import RuTranslator
 
@@ -28,9 +28,6 @@ logger = logging.getLogger("polymarket-telegram-bot")
 
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
-    if not signals:
-        return "🕵️ Инсайдерские сделки: за последний период крупных сделок не найдено."
-
     lines = ["🕵️ Инсайдерская торговля (топ-3):"]
     for idx, signal in enumerate(signals, start=1):
         price = max(0.01, min(0.99, signal.price))
@@ -94,13 +91,10 @@ def welcome_text() -> str:
     return (
         "Привет! Я бот с сигналами Polymarket.\n\n"
         "Что отправляю:\n"
-        "• Инсайдерские сделки (крупные входы кошельков).\n"
-        "• Высоковероятные рынки (сильный отрыв лидера).\n"
-        "• Горячие ставки (рынки, которые закроются в ближайшие 5 дней).\n"
-        "• В каждом сигнале есть профит при ставке $1.\n\n"
-        "Тарифы:\n"
-        "• Free — активируется автоматически после /start, 1 раз в день.\n"
-        "• Pro150 — 150 Telegram Stars за 30 дней, сигналы каждый час.\n\n"
+        "• Инсайдерские сделки — проверка каждый час, отправляю только когда есть сделки.\n"
+        "• Высокая вероятность — 2 раза в день (Pro).\n"
+        "• Горячие ставки — раз в 3 часа, только если есть изменения (Pro).\n"
+        "• Бесплатный тариф: только высокая вероятность 1 раз в 2 дня.\n\n"
         "Покупка Stars: @PremiumBot\n"
         "Команды: /mode insider|probability|hot|both, /my, /buy, /stop"
     )
@@ -159,18 +153,12 @@ class BotService:
         sub = self.store.ensure_free(update.effective_user.id)
         plan = "Pro150" if sub.effective_plan() == PRO_PLAN else "Free"
         paid_until = sub.paid_until.isoformat() if sub.paid_until else "-"
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"Тариф: {plan}\nРежим: {sub.mode}\nPro до: {paid_until}",
-        )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Тариф: {plan}\nРежим: {sub.mode}\nPro до: {paid_until}")
 
     async def cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_chat:
             return
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Тариф Pro150 = 150 ⭐ за 30 дней. Купи Stars в @PremiumBot и напиши админу для активации.",
-        )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Тариф Pro150 = 150 ⭐ за 30 дней. Купи Stars в @PremiumBot и напиши админу для активации.")
 
     async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
@@ -193,14 +181,7 @@ class BotService:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="Неверный формат")
             return
         sub = self.store.grant_pro(user_id)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"Выдан Pro150 пользователю {user_id} до {sub.paid_until.isoformat()}",
-        )
-        try:
-            await context.bot.send_message(chat_id=user_id, text="Тариф Pro150 активирован ✅")
-        except Exception:
-            logger.warning("Could not notify user %s", user_id)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Выдан Pro150 пользователю {user_id} до {sub.paid_until.isoformat()}")
 
     async def cmd_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
@@ -214,36 +195,14 @@ class BotService:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="Анализ ещё не запускался.")
             return
 
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                "🧾 Последние данные анализа\n"
-                f"Время UTC: {payload.get('generated_at', '-')}\n"
-                f"Рынков: {payload.get('markets_count', 0)}\n"
-                f"Инсайдерских сигналов: {payload.get('insider_signals_count', 0)}\n"
-                f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}\n"
-                f"Горячих сигналов: {payload.get('hot_signals_count', 0)}"
-            ),
-        )
-        if self._analysis_enabled("insider"):
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=format_insider_message(self._restore_insider_signals(payload.get("insider_signals", []))),
-            )
-        if self._analysis_enabled("probability"):
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=format_probability_message(self._restore_probability_signals(payload.get("probability_signals", []))),
-                disable_web_page_preview=True,
-                parse_mode="HTML",
-            )
-        if self._analysis_enabled("hot"):
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=format_hot_message(self._restore_probability_signals(payload.get("hot_signals", []))),
-                disable_web_page_preview=True,
-                parse_mode="HTML",
-            )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=(
+            "🧾 Последние данные анализа\n"
+            f"Время UTC: {payload.get('generated_at', '-')}\n"
+            f"Рынков: {payload.get('markets_count', 0)}\n"
+            f"Инсайдерских сигналов: {payload.get('insider_signals_count', 0)}\n"
+            f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}\n"
+            f"Горячих сигналов: {payload.get('hot_signals_count', 0)}"
+        ))
 
     async def analysis_loop(self) -> None:
         logger.info("Запущен цикл анализа. Интервал опроса: %s сек.", self.settings.polling_interval_seconds)
@@ -259,77 +218,75 @@ class BotService:
     async def _maybe_send_admin_heartbeat(self, now: datetime) -> None:
         if self._last_admin_heartbeat_sent and (now - self._last_admin_heartbeat_sent).total_seconds() < 3600:
             return
-
         heartbeat_text = (
             "🫀 Служебный пинг бота\n"
             f"Время UTC: {now.isoformat(timespec='seconds')}\n"
             "Статус: бот запущен и выполняет цикл анализа."
         )
-        logger.info("Отправляю служебный часовой пинг админу %s", self.settings.admin_chat_id)
         await self.sender.send_to(self.settings.admin_chat_id, heartbeat_text)
         self._last_admin_heartbeat_sent = now
 
     def _analysis_enabled(self, option: str) -> bool:
-        if self.settings.analysis_mode == "both":
-            return True
-        return self.settings.analysis_mode == option
+        return self.settings.analysis_mode == "both" or self.settings.analysis_mode == option
+
+    def _hot_signature(self, signals: list[ProbabilitySignal]) -> str:
+        payload = [(s.market_id, s.leading_outcome, round(s.leading_probability, 4), round(s.gap, 4)) for s in signals]
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
+        if sub.effective_plan() == FREE_PLAN:
+            if label != "probability":
+                return False
+            last = sub.last_sent_probability_at
+            return last is None or now - last >= timedelta(days=2)
+
+        if label == "insider":
+            last = sub.last_sent_insider_at
+            interval = timedelta(hours=1)
+        elif label == "probability":
+            last = sub.last_sent_probability_at
+            interval = timedelta(hours=12)
+        elif label == "hot":
+            last = sub.last_sent_hot_at
+            interval = timedelta(hours=3)
+        else:
+            return False
+        return last is None or now - last >= interval
+
+    def _mode_allows_label(self, sub: UserSubscription, label: str) -> bool:
+        if sub.effective_plan() == FREE_PLAN:
+            return label == "probability"
+        return sub.mode in {label, "both"}
 
     async def _run_cycle(self, now: datetime) -> None:
-        logger.info("Старт цикла анализа за %s", now.isoformat(timespec="seconds"))
-        logger.info("Запрашиваю рынки Polymarket")
         markets = await self.client.fetch_markets()
-        logger.info("Получено рынков: %s", len(markets))
-
         insider_signals: list[InsiderSignal] = []
         probability_signals: list[ProbabilitySignal] = []
         hot_signals: list[ProbabilitySignal] = []
 
         if self._analysis_enabled("insider"):
-            logger.info("Режим включает инсайдерский анализ — загружаю последние сделки")
             trades = await self.client.fetch_recent_trades()
-            insider_signals = await asyncio.to_thread(
-                self.analyzer.insider_signals,
-                trades,
-                markets,
-                self.settings.insider_top_n,
-            )
-            logger.info("Найдено инсайдерских сигналов: %s", len(insider_signals))
+            insider_signals = await asyncio.to_thread(self.analyzer.insider_signals, trades, markets, self.settings.insider_top_n)
 
         if self._analysis_enabled("probability"):
-            logger.info("Режим включает анализ вероятностей — строю сигналы")
-            probability_signals = await asyncio.to_thread(
-                self.analyzer.probability_signals,
-                markets,
-                self.settings.probability_top_n,
-            )
-            logger.info("Найдено сигналов высокой вероятности: %s", len(probability_signals))
+            probability_signals = await asyncio.to_thread(self.analyzer.probability_signals, markets, self.settings.probability_top_n)
 
         if self._analysis_enabled("hot"):
-            logger.info("Режим включает анализ горячих ставок — строю сигналы")
-            hot_signals = await asyncio.to_thread(
-                self.analyzer.hot_signals,
-                markets,
-                self.settings.hot_top_n,
-            )
-            logger.info("Найдено горячих сигналов: %s", len(hot_signals))
+            hot_signals = await asyncio.to_thread(self.analyzer.hot_signals, markets, self.settings.hot_top_n)
 
-        await self._save_analysis_snapshot(now, markets, insider_signals, probability_signals, hot_signals)
+        previous_snapshot = await self._load_analysis_snapshot() or {}
+        previous_hot_signature = str(previous_snapshot.get("hot_signature") or "")
+        hot_signature = self._hot_signature(hot_signals)
+        hot_changed = hot_signature != previous_hot_signature
 
-        insider_text = format_insider_message(insider_signals)
-        probability_text = format_probability_message(probability_signals)
-        hot_text = format_hot_message(hot_signals)
+        await self._save_analysis_snapshot(now, markets, insider_signals, probability_signals, hot_signals, hot_signature)
 
-        sent_labels: set[tuple[int, str]] = set()
+        messages = {
+            "insider": format_insider_message(insider_signals) if insider_signals else "",
+            "probability": format_probability_message(probability_signals),
+            "hot": format_hot_message(hot_signals),
+        }
 
-        logger.info("Отправляю отчёты админу %s", self.settings.admin_chat_id)
-        if self._analysis_enabled("insider"):
-            await self._send_unique(self.settings.admin_chat_id, "insider", insider_text, sent_labels)
-        if self._analysis_enabled("probability"):
-            await self._send_unique(self.settings.admin_chat_id, "probability", probability_text, sent_labels)
-        if self._analysis_enabled("hot"):
-            await self._send_unique(self.settings.admin_chat_id, "hot", hot_text, sent_labels)
-
-        reminder_count = 0
         for user_id, days, paid_until in self.store.due_renewal_reminders(now):
             reminder_text = (
                 f"⏳ До окончания Pro150 осталось {days} дн.\n"
@@ -338,42 +295,27 @@ class BotService:
             )
             await self.sender.send_to(user_id, reminder_text)
             self.store.mark_reminder_sent(user_id, days, paid_until)
-            reminder_count += 1
 
-        if reminder_count:
-            logger.info("Отправлено напоминаний о продлении: %s", reminder_count)
-        else:
-            logger.info("Напоминаний о продлении в этом цикле нет")
+        sent_users: set[int] = set()
+        for sub in self.store.active_users():
+            for label in ("insider", "probability", "hot"):
+                if not self._analysis_enabled(label):
+                    continue
+                if not self._mode_allows_label(sub, label):
+                    continue
+                if not self._is_due(sub, label, now):
+                    continue
+                if label == "insider" and not insider_signals:
+                    continue
+                if label == "hot" and not hot_changed:
+                    continue
 
-        sent_users = 0
-        for sub in self.store.active_users_due(now):
-            if sub.user_id == self.settings.admin_chat_id:
-                continue
+                parse_mode = "HTML" if label in {"probability", "hot"} else None
+                await self.sender.send_to(sub.user_id, messages[label], parse_mode=parse_mode)
+                self.store.mark_sent(sub.user_id, label, now)
+                sent_users.add(sub.user_id)
 
-            messages: list[tuple[str, str]] = []
-            if sub.mode in {"insider", "both"} and self._analysis_enabled("insider"):
-                messages.append(("insider", insider_text))
-            if sub.mode in {"probability", "both"} and self._analysis_enabled("probability"):
-                messages.append(("probability", probability_text))
-            if sub.mode in {"hot", "both"} and self._analysis_enabled("hot"):
-                messages.append(("hot", hot_text))
-
-            if not messages:
-                continue
-            for label, message in messages:
-                await self._send_unique(sub.user_id, label, message, sent_labels)
-            self.store.mark_sent(sub.user_id, now)
-            sent_users += 1
-
-        logger.info("Цикл завершён. Пользователей, получивших рассылку: %s", sent_users)
-
-    async def _send_unique(self, chat_id: int, label: str, text: str, sent_labels: set[tuple[int, str]]) -> None:
-        key = (chat_id, label)
-        if key in sent_labels:
-            return
-        parse_mode = "HTML" if label in {"probability", "hot"} else None
-        await self.sender.send_to(chat_id, text, parse_mode=parse_mode)
-        sent_labels.add(key)
+        logger.info("Цикл завершён. Пользователей, получивших рассылку: %s", len(sent_users))
 
     async def _save_analysis_snapshot(
         self,
@@ -382,6 +324,7 @@ class BotService:
         insider_signals: list[InsiderSignal],
         probability_signals: list[ProbabilitySignal],
         hot_signals: list[ProbabilitySignal],
+        hot_signature: str,
     ) -> None:
         payload = {
             "generated_at": now.isoformat(timespec="seconds"),
@@ -389,6 +332,7 @@ class BotService:
             "insider_signals_count": len(insider_signals),
             "probability_signals_count": len(probability_signals),
             "hot_signals_count": len(hot_signals),
+            "hot_signature": hot_signature,
             "insider_signals": [signal.__dict__ for signal in insider_signals],
             "probability_signals": [signal.__dict__ for signal in probability_signals],
             "hot_signals": [signal.__dict__ for signal in hot_signals],
@@ -403,23 +347,11 @@ class BotService:
             try:
                 return json.loads(self._analysis_cache_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
-                logger.warning("Повреждён файл кэша анализа: %s", self._analysis_cache_path)
                 return None
 
-    @staticmethod
-    def _restore_insider_signals(rows: list[dict[str, Any]]) -> list[InsiderSignal]:
-        return [InsiderSignal(**row) for row in rows if isinstance(row, dict)]
-
-    @staticmethod
-    def _restore_probability_signals(rows: list[dict[str, Any]]) -> list[ProbabilitySignal]:
-        return [ProbabilitySignal(**row) for row in rows if isinstance(row, dict)]
-
     async def run(self) -> None:
-        logger.info("Инициализирую Telegram-приложение")
         await self.application.initialize()
-        logger.info("Запускаю Telegram-приложение")
         await self.application.start()
-        logger.info("Включаю long polling")
         await self.application.updater.start_polling(drop_pending_updates=True)
         await self._send_startup_message_to_admin()
         analysis_task = asyncio.create_task(self.analysis_loop(), name="analysis-loop")
@@ -428,11 +360,8 @@ class BotService:
         finally:
             analysis_task.cancel()
             await asyncio.gather(analysis_task, return_exceptions=True)
-            logger.info("Останавливаю long polling")
             await self.application.updater.stop()
-            logger.info("Останавливаю Telegram-приложение")
             await self.application.stop()
-            logger.info("Завершаю Telegram-приложение")
             await self.application.shutdown()
 
     async def _send_startup_message_to_admin(self) -> None:
@@ -444,7 +373,6 @@ class BotService:
             f"{welcome_text()}\n\n"
             "Админ-команда: /analysis — показать последние данные анализа."
         )
-        logger.info("Отправляю приветственное сообщение при старте админу %s", self.settings.admin_chat_id)
         await self.sender.send_to(self.settings.admin_chat_id, startup_text)
 
 
