@@ -208,6 +208,16 @@ class BotService:
         first_slot = self._slot_at(next_day, min(hours))
         return first_slot.astimezone(timezone.utc)
 
+    def _next_probability_schedule_slot(self, now: datetime, hours: tuple[int, ...]) -> datetime:
+        ekb_now = now.astimezone(EKB_TZ)
+        for hour in sorted(hours):
+            slot = self._slot_at(ekb_now, hour)
+            if ekb_now <= slot:
+                return slot.astimezone(timezone.utc)
+
+        next_day = ekb_now + timedelta(days=1)
+        return self._slot_at(next_day, min(hours)).astimezone(timezone.utc)
+
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler("start", self.cmd_start))
         self.application.add_handler(CommandHandler("help", self.cmd_start))
@@ -368,11 +378,12 @@ class BotService:
 
         now = datetime.now(timezone.utc)
         admin_sub = self.store.ensure_free(self.settings.admin_chat_id)
+        next_free_schedule = self._format_ekb_time(self._next_probability_schedule_slot(now, FREE_PROBABILITY_HOURS_EKB))
         lines = [
             "⏱ Следующее время рассылки подписчикам (Екатеринбург):",
             f"Крупные ставки (Pro + админ): {self._next_due_for_label(admin_sub, 'insider', now)}",
             f"Вероятность (Pro + админ): {self._next_due_for_label(admin_sub, 'probability', now)}",
-            f"Вероятность (Free): {self._next_due_for_label(self._free_reference_subscription(now), 'probability', now)}",
+            f"Вероятность (Free): {next_free_schedule}",
             f"Горячие (Pro + админ): {self._next_due_for_label(admin_sub, 'hot', now)}",
         ]
         await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines))
