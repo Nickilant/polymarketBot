@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from telegram import LabeledPrice, Update
 from telegram.ext import (
@@ -38,6 +39,7 @@ PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=12)
 HOT_ANALYSIS_INTERVAL = timedelta(hours=1)
 PRO_PRICE_STARS = 150
 PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
+EKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
@@ -117,7 +119,7 @@ def welcome_text() -> str:
         "• Высокая вероятность — ставки с высокой вероятностью выигрыша (раз в 12 часов).\n"
         "• Горячие ставки — по одной лучшей ставке каждый час без повторов в течение суток.\n\n"
         "Тарифы:\n"
-        "• Free: только ставки высокой вероятности раз в 2 дня\n"
+        "• Free: только ставки высокой вероятности каждый день в 08:00 (Екатеринбург)\n"
         "• Pro: полный комплект информации\n"
         "Купить Pro : /buy (Telegram Stars).\n"
         "Команды: /mode insider|probability|hot|both, /my, /buy, /stop"
@@ -145,6 +147,42 @@ class BotService:
         self._last_hot_analysis_at: datetime | None = None
         self._last_probability_signals: list[ProbabilitySignal] = []
         self._register_handlers()
+
+    @staticmethod
+    def _format_ekb_time(value: datetime) -> str:
+        return value.astimezone(EKB_TZ).strftime("%d.%m.%Y %H:%M")
+
+    @staticmethod
+    def _parse_iso_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _next_free_probability_send_at(self, now: datetime, last_sent: datetime | None = None) -> datetime:
+        ekb_now = now.astimezone(EKB_TZ)
+        candidate = ekb_now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if ekb_now > candidate:
+            candidate += timedelta(days=1)
+
+        if last_sent:
+            last_ekb = last_sent.astimezone(EKB_TZ)
+            last_slot = last_ekb.replace(hour=8, minute=0, second=0, microsecond=0)
+            if last_ekb >= last_slot and candidate.date() <= last_slot.date():
+                candidate = last_slot + timedelta(days=1)
+
+        return candidate.astimezone(timezone.utc)
+
+    def _is_free_probability_due(self, now: datetime, last_sent: datetime | None) -> bool:
+        ekb_now = now.astimezone(EKB_TZ)
+        slot_today = ekb_now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if ekb_now < slot_today:
+            return False
+        if not last_sent:
+            return True
+        return last_sent.astimezone(EKB_TZ) < slot_today
 
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -259,7 +297,11 @@ class BotService:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="Неверный формат")
             return
         sub = self.store.grant_pro(user_id)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Выдан Pro150 пользователю {user_id} до {sub.paid_until.isoformat()}")
+        paid_until_text = self._format_ekb_time(sub.paid_until) if sub.paid_until else "-"
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Выдан Pro150 пользователю {user_id} до {paid_until_text} (Екатеринбург)",
+        )
 
     async def cmd_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
@@ -274,9 +316,11 @@ class BotService:
             return
 
         chat_id = update.effective_chat.id
+        generated_at = self._parse_iso_datetime(str(payload.get("generated_at") or ""))
+        generated_at_text = self._format_ekb_time(generated_at) if generated_at else "-"
         await context.bot.send_message(chat_id=chat_id, text=(
             "🧾 Последние данные анализа\n"
-            f"Время UTC: {payload.get('generated_at', '-')}\n"
+            f"Время (Екатеринбург): {generated_at_text}\n"
             f"Рынков: {payload.get('markets_count', 0)}\n"
             f"Крупных ставок: {payload.get('insider_signals_count', 0)}\n"
             f"Вероятностных сигналов: {payload.get('probability_signals_count', 0)}\n"
@@ -301,7 +345,7 @@ class BotService:
         now = datetime.now(timezone.utc)
         admin_sub = self.store.ensure_free(self.settings.admin_chat_id)
         lines = [
-            "⏱ Следующее время рассылки подписчикам (UTC):",
+            "⏱ Следующее время рассылки подписчикам (Екатеринбург):",
             f"Крупные ставки (Pro + админ): {self._next_due_for_label(admin_sub, 'insider', now)}",
             f"Вероятность (Pro + админ): {self._next_due_for_label(admin_sub, 'probability', now)}",
             f"Вероятность (Free): {self._next_due_for_label(self._free_reference_subscription(now), 'probability', now)}",
@@ -334,7 +378,7 @@ class BotService:
             return
         heartbeat_text = (
             "🫀 Служебный пинг бота\n"
-            f"Время UTC: {now.isoformat(timespec='seconds')}\n"
+            f"Время (Екатеринбург): {self._format_ekb_time(now)}\n"
             "Статус: бот запущен и выполняет цикл анализа."
         )
         await self.sender.send_to(self.settings.admin_chat_id, heartbeat_text)
@@ -398,7 +442,7 @@ class BotService:
 
         if sub.effective_plan() == FREE_PLAN:
             if label == "probability":
-                return timedelta(days=2)
+                return timedelta(days=1)
             return None
 
         if label == "insider":
@@ -419,6 +463,13 @@ class BotService:
         return None
 
     def _next_due_for_label(self, sub: UserSubscription, label: str, now: datetime) -> str:
+        if sub.effective_plan() == FREE_PLAN and label == "probability":
+            last_sent = self._last_sent_for_label(sub, label)
+            if self._is_free_probability_due(now, last_sent):
+                return self._format_ekb_time(now + timedelta(minutes=5))
+            next_free_due_at = self._next_free_probability_send_at(now, last_sent)
+            return self._format_ekb_time(next_free_due_at)
+
         interval = self._interval_for_label(sub, label)
         if interval is None:
             return "недоступно для текущего тарифа/режима"
@@ -427,15 +478,18 @@ class BotService:
         if last is None:
             if analysis_due_at is None:
                 return "сразу при следующем цикле"
-            return analysis_due_at.isoformat(timespec="seconds")
+            return self._format_ekb_time(analysis_due_at)
         due_at = last + interval
         if analysis_due_at is not None and analysis_due_at > due_at:
             due_at = analysis_due_at
         if due_at <= now:
-            return (now + timedelta(minutes=5)).isoformat(timespec="seconds")
-        return due_at.isoformat(timespec="seconds")
+            return self._format_ekb_time(now + timedelta(minutes=5))
+        return self._format_ekb_time(due_at)
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
+        if sub.effective_plan() == FREE_PLAN and label == "probability":
+            return self._is_free_probability_due(now, self._last_sent_for_label(sub, label))
+
         interval = self._interval_for_label(sub, label)
         if interval is None:
             return False
@@ -493,7 +547,7 @@ class BotService:
             self.settings.admin_chat_id,
             (
                 f"📣 Выполнена рассылка {labels.get(label, label)}\n"
-                f"UTC: {now.isoformat(timespec='seconds')}\n"
+                f"Время (Екатеринбург): {self._format_ekb_time(now)}\n"
                 f"Получателей: {sent_count}"
             ),
         )
