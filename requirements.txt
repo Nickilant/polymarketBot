@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 httpx==0.27.2
 deep-translator==1.11.4
 python-dotenv==1.0.1
+tzdata==2025.3

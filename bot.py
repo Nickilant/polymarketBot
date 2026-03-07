@@ -6,7 +6,10 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 from telegram import LabeledPrice, Update
 from telegram.ext import (
@@ -20,8 +23,15 @@ from telegram.ext import (
 
 from polymarket_bot.analyzer import Analyzer
 from polymarket_bot.config import Settings, load_settings
+from polymarket_bot.formatters import (
+    format_insider_message,
+    format_probability_message,
+    format_hot_message,
+    format_rich_insider_message,
+)
 from polymarket_bot.models import InsiderSignal, MarketView, ProbabilitySignal
 from polymarket_bot.polymarket_client import PolymarketClient
+from polymarket_bot.signals import RichSignal
 from polymarket_bot.subscriptions import FREE_PLAN, PRO_PLAN, SubscriptionStore, UserSubscription, VALID_MODES
 from polymarket_bot.telegram_sender import TelegramSender
 from polymarket_bot.translator import RuTranslator
@@ -45,74 +55,6 @@ EKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 FREE_PROBABILITY_HOURS_EKB = (8,)
 PRO_PROBABILITY_HOURS_EKB = (8, 19)
 
-
-def format_insider_message(signals: list[InsiderSignal]) -> str:
-    if not signals:
-        return "💰 Крупные ставки: сигналов нет."
-
-    lines = [f"💰 Крупные ставки (топ-{len(signals)}):"]
-    for idx, signal in enumerate(signals, start=1):
-        price = max(0.01, min(0.99, signal.price))
-        profit = (1.0 / price) - 1.0
-        whale_label = "🐋 Whale" if signal.is_whale else ""
-        safe_name = html.escape(signal.market_name_ru)
-        safe_wallet = html.escape(signal.wallet)
-        safe_outcome = html.escape(signal.outcome)
-        lines.append(
-            (
-                f"{idx}) {safe_name}\n"
-                f"Кошелёк: {safe_wallet} | Исход: {safe_outcome} ({price * 100:.1f}%)\n"
-                f"Крупнейшая ставка: ${signal.amount_usd:,.0f} | Общий объём: ${signal.total_volume:,.0f}\n"
-                f"Сделок: {signal.trade_count} | Цена входа: {price * 100:.1f}% | Профит с $1: ${profit:.2f} {whale_label}\n"
-                f"{_format_market_link(signal.market_url)}"
-            )
-        )
-    return "\n\n".join(lines)
-
-
-def _format_market_link(market_url: str) -> str:
-    safe_url = html.escape(market_url, quote=True)
-    return f"<a href=\"{safe_url}\">ссылка на маркет</a>" if market_url else "ссылка на маркет: недоступна"
-
-
-def format_probability_message(signals: list[ProbabilitySignal]) -> str:
-    if not signals:
-        return "📈 Высокая вероятность: подходящих рынков сейчас нет."
-
-    lines = ["📈 Высокая вероятность (топ-10):"]
-    for idx, signal in enumerate(signals, start=1):
-        safe_name = html.escape(signal.market_name_ru)
-        safe_outcome = html.escape(signal.leading_outcome)
-        lines.append(
-            (
-                f"{idx}) {safe_name}\n"
-                f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
-                f" | Отрыв: {signal.gap * 100:.1f}%\n"
-                f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
-                f"{_format_market_link(signal.market_url)}"
-            )
-        )
-    return "\n\n".join(lines)
-
-
-def format_hot_message(signals: list[ProbabilitySignal]) -> str:
-    if not signals:
-        return "🔥 Горячие ставки: подходящих рынков сейчас нет."
-
-    lines = ["🔥 Горячие ставки (закрытие в ближайшие 5 дней):"]
-    for idx, signal in enumerate(signals, start=1):
-        safe_name = html.escape(signal.market_name_ru)
-        safe_outcome = html.escape(signal.leading_outcome)
-        lines.append(
-            (
-                f"{idx}) {safe_name}\n"
-                f"Лидер: {safe_outcome} ({signal.leading_probability * 100:.1f}%)"
-                f" | Отрыв: {signal.gap * 100:.1f}%\n"
-                f"Профит с $1: ${signal.win_if_1_dollar:.2f}\n"
-                f"{_format_market_link(signal.market_url)}"
-            )
-        )
-    return "\n\n".join(lines)
 
 
 def welcome_text() -> str:
@@ -150,6 +92,7 @@ class BotService:
         self._last_probability_analysis_at: datetime | None = None
         self._last_hot_analysis_at: datetime | None = None
         self._last_probability_signals: list[ProbabilitySignal] = []
+        self._last_rich_insider_signals: list[RichSignal] = []
         self._register_handlers()
 
     @staticmethod
@@ -655,7 +598,13 @@ class BotService:
         if insider_due:
             await self._notify_admin_analysis_started("insider", now)
             trades = await self.client.fetch_recent_trades()
-            insider_signals = await asyncio.to_thread(self.analyzer.insider_signals, trades, markets, self.settings.insider_top_n)
+            rich_signals = await asyncio.to_thread(
+                self.analyzer.rich_insider_signals, trades, markets, self.settings.insider_top_n
+            )
+            self._last_rich_insider_signals = rich_signals
+            # insider_signals нужен для snapshot/signature — конвертируем
+            from polymarket_bot.analyzer import _rich_to_insider
+            insider_signals = [_rich_to_insider(s) for s in rich_signals]
             self._last_insider_analysis_at = now
 
         if probability_due:
@@ -691,7 +640,9 @@ class BotService:
             self._log_hot_signals_snapshot(hot_signals, now)
         selected_hot_signal = self._pick_next_hot_signal(hot_signals, now) if hot_due else None
         messages = {
-            "insider": format_insider_message(insider_signals),
+            "insider": format_rich_insider_message(
+                self._last_rich_insider_signals) if self._last_rich_insider_signals else format_insider_message(
+                insider_signals),
             "probability": format_probability_message(probability_signals),
             "hot": format_hot_message([selected_hot_signal]) if selected_hot_signal else "",
         }
