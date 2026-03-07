@@ -32,6 +32,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("polymarket-telegram-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 INSIDER_CHECK_INTERVAL_SECONDS = 60
 INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=1)
@@ -425,6 +427,23 @@ class BotService:
         ]
         return json.dumps(payload, ensure_ascii=False)
 
+    def _log_hot_signals_snapshot(self, hot_signals: list[ProbabilitySignal], now: datetime) -> None:
+        if not hot_signals:
+            logger.info("Hot snapshot %s UTC: сигналов не найдено", now.isoformat(timespec="seconds"))
+            return
+
+        lines = [
+            f"{idx}. {signal.market_name_ru} | id={signal.market_id} | "
+            f"исход={signal.leading_outcome} | p={signal.leading_probability:.3f} | gap={signal.gap:.3f}"
+            for idx, signal in enumerate(hot_signals, start=1)
+        ]
+        logger.info(
+            "Hot snapshot %s UTC (без фильтрации по истории отправок, всего=%s):\n%s",
+            now.isoformat(timespec="seconds"),
+            len(hot_signals),
+            "\n".join(lines),
+        )
+
 
     @staticmethod
     def _daily_hot_reset_time(now: datetime) -> datetime:
@@ -657,6 +676,8 @@ class BotService:
             insider_signature,
         )
 
+        if hot_due:
+            self._log_hot_signals_snapshot(hot_signals, now)
         selected_hot_signal = self._pick_next_hot_signal(hot_signals, now) if hot_due else None
         messages = {
             "insider": format_insider_message(insider_signals),
