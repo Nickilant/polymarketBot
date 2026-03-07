@@ -42,6 +42,16 @@ class Analyzer:
         wallet_stats: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(
             lambda: {"total_volume": 0.0, "trade_count": 0, "max_trade": 0.0, "last_trade": None}
         )
+        wallet_totals: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "total_volume": 0.0,
+                "trade_count": 0,
+                "max_trade": 0.0,
+                "last_trade": None,
+                "market_ids": set(),
+                "market_totals": defaultdict(float),
+            }
+        )
 
         for trade in trades:
             market_id = str(
@@ -79,6 +89,15 @@ class Analyzer:
                 stats["max_trade"] = trade_size
                 stats["last_trade"] = trade
 
+            wallet_summary = wallet_totals[wallet]
+            wallet_summary["total_volume"] += trade_size
+            wallet_summary["trade_count"] += 1
+            wallet_summary["market_ids"].add(market_id)
+            wallet_summary["market_totals"][market_id] += trade_size
+            if trade_size >= wallet_summary["max_trade"]:
+                wallet_summary["max_trade"] = trade_size
+                wallet_summary["last_trade"] = trade
+
         signals: list[InsiderSignal] = []
         for key, stats in wallet_stats.items():
             total_volume = stats["total_volume"]
@@ -109,6 +128,60 @@ class Analyzer:
                     trade_count=stats["trade_count"],
                     is_whale=total_volume >= 50000,
                     outcome=outcome,
+                    price=price,
+                    market_url=market.market_url,
+                )
+            )
+
+        for wallet, stats in wallet_totals.items():
+            total_volume = float(stats["total_volume"])
+            unique_markets = len(stats["market_ids"])
+            market_totals: dict[str, float] = dict(stats["market_totals"])
+            largest_market_volume = max(market_totals.values(), default=0.0)
+
+            # Дополнительно отслеживаем кошельки, которые набирают крупный объём
+            # суммой мелких ставок на разных рынках.
+            if (
+                total_volume < self._insider_min_trade_usd
+                or unique_markets < 2
+                or largest_market_volume >= self._insider_min_trade_usd
+            ):
+                continue
+
+            trade = stats["last_trade"] or {}
+            market_id = str(
+                trade.get("conditionId")
+                or trade.get("market")
+                or trade.get("marketId")
+                or ""
+            )
+            market = market_by_id.get(market_id)
+            if not market:
+                title = str(trade.get("title") or "").strip().lower()
+                if title:
+                    market = market_by_name.get(title)
+            if not market:
+                continue
+
+            outcome = (
+                trade.get("outcome")
+                or trade.get("side")
+                or str(trade.get("outcomeIndex"))
+                or "N/A"
+            )
+            price = float(trade.get("price") or trade.get("outcomePrice") or 0.5)
+            name_ru = self._translator.translate(market.market_name)
+            signals.append(
+                InsiderSignal(
+                    market_id=market.market_id,
+                    market_name_en=market.market_name,
+                    market_name_ru=f"{name_ru} (активность кита на {unique_markets} рынках)",
+                    wallet=self._short_wallet(wallet),
+                    amount_usd=float(stats["max_trade"]),
+                    total_volume=total_volume,
+                    trade_count=int(stats["trade_count"]),
+                    is_whale=True,
+                    outcome=str(outcome).strip() or "N/A",
                     price=price,
                     market_url=market.market_url,
                 )

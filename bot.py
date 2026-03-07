@@ -347,6 +347,11 @@ class BotService:
         payload = [(s.market_id, s.leading_outcome, round(s.leading_probability, 4), round(s.gap, 4)) for s in signals]
         return json.dumps(payload, ensure_ascii=False)
 
+    @staticmethod
+    def _hot_market_key(signal: ProbabilitySignal) -> str:
+        base_name = signal.market_name_en or signal.market_name_ru or signal.market_id
+        return " ".join(base_name.lower().split())
+
     def _insider_signature(self, signals: list[InsiderSignal]) -> str:
         payload = [
             (s.market_id, s.wallet, s.outcome, round(s.amount_usd, 2), round(s.price, 4))
@@ -363,22 +368,22 @@ class BotService:
         if not hot_signals:
             return None
 
-        sent_ids, reset_at = self.store.get_global_hot_progress()
+        sent_keys, reset_at = self.store.get_global_hot_progress()
         if reset_at is None or now >= reset_at:
-            sent_ids = []
+            sent_keys = []
             reset_at = self._daily_hot_reset_time(now)
 
-        sent_set = set(sent_ids)
-        available = [signal for signal in hot_signals if signal.market_id not in sent_set]
+        sent_set = set(sent_keys)
+        available = [signal for signal in hot_signals if self._hot_market_key(signal) not in sent_set]
 
         if not available:
-            sent_ids = []
+            sent_keys = []
             reset_at = self._daily_hot_reset_time(now)
             available = hot_signals
 
         selected = available[0]
-        sent_ids.append(selected.market_id)
-        self.store.set_global_hot_progress(sent_ids, reset_at)
+        sent_keys.append(self._hot_market_key(selected))
+        self.store.set_global_hot_progress(sent_keys, reset_at)
         return selected
 
     def _interval_for_label(self, sub: UserSubscription, label: str) -> timedelta | None:
@@ -472,9 +477,10 @@ class BotService:
             "probability": "высокой вероятности",
             "hot": "горячих ставок",
         }
-        await self.sender.send_to(
-            self.settings.admin_chat_id,
-            f"🔎 Начинается анализ {labels.get(label, label)} ({now.isoformat(timespec='seconds')} UTC)",
+        logger.info(
+            "Начинается анализ %s (%s UTC)",
+            labels.get(label, label),
+            now.isoformat(timespec="seconds"),
         )
 
     async def _notify_admin_distribution(self, label: str, sent_count: int, now: datetime) -> None:
@@ -502,15 +508,19 @@ class BotService:
         insider_changed: bool,
         hot_changed: bool,
     ) -> None:
-        report = (
-            "🧪 Короткий отчёт анализа\n"
-            f"UTC: {now.isoformat(timespec='seconds')}\n"
-            f"Рынков: {markets_count}\n"
-            f"Крупные ставки: {insider_signals_count} ({'изменились' if insider_changed else 'без изменений'})\n"
-            f"Вероятность: {probability_signals_count}\n"
-            f"Горячие: {hot_signals_count} ({'изменились' if hot_changed else 'без изменений'})"
+        logger.info(
+            (
+                "Короткий отчёт анализа | UTC: %s | Рынков: %s | "
+                "Крупные ставки: %s (%s) | Вероятность: %s | Горячие: %s (%s)"
+            ),
+            now.isoformat(timespec="seconds"),
+            markets_count,
+            insider_signals_count,
+            "изменились" if insider_changed else "без изменений",
+            probability_signals_count,
+            hot_signals_count,
+            "изменились" if hot_changed else "без изменений",
         )
-        await self.sender.send_to(self.settings.admin_chat_id, report)
 
     async def _run_cycle(self, now: datetime) -> None:
         self.store.ensure_free(self.settings.admin_chat_id)
