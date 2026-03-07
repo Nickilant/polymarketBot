@@ -33,13 +33,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("polymarket-telegram-bot")
 
-INSIDER_CHECK_INTERVAL_SECONDS = 300
-INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=5)
+INSIDER_CHECK_INTERVAL_SECONDS = 60
+INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=1)
 PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=12)
 HOT_ANALYSIS_INTERVAL = timedelta(hours=1)
 PRO_PRICE_STARS = 150
 PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
 EKB_TZ = ZoneInfo("Asia/Yekaterinburg")
+FREE_PROBABILITY_HOURS_EKB = (8,)
+PRO_PROBABILITY_HOURS_EKB = (8, 19)
 
 
 def format_insider_message(signals: list[InsiderSignal]) -> str:
@@ -115,8 +117,8 @@ def welcome_text() -> str:
     return (
         "Привет! Я бот с сигналами Polymarket.\n\n"
         "Что отправляю:\n"
-        "• Крупные ставки — крупные ставки от одного кошелька (каждые 5 минут).\n"
-        "• Высокая вероятность — ставки с высокой вероятностью выигрыша (2 раза в день для Pro/админа).\n"
+        "• Крупные ставки — крупные ставки от одного кошелька (каждую минуту).\n"
+        "• Высокая вероятность — по расписанию: Free в 08:00, Pro/админ в 08:00 и 19:00 (Екатеринбург).\n"
         "• Горячие ставки — по одной лучшей ставке каждый час без повторов в течение суток.\n\n"
         "Тарифы:\n"
         "• Free: только ставки высокой вероятности каждый день в 08:00 (Екатеринбург)\n"
@@ -162,27 +164,47 @@ class BotService:
             return None
 
     def _next_free_probability_send_at(self, now: datetime, last_sent: datetime | None = None) -> datetime:
-        ekb_now = now.astimezone(EKB_TZ)
-        candidate = ekb_now.replace(hour=8, minute=0, second=0, microsecond=0)
-        if ekb_now > candidate:
-            candidate += timedelta(days=1)
-
-        if last_sent:
-            last_ekb = last_sent.astimezone(EKB_TZ)
-            last_slot = last_ekb.replace(hour=8, minute=0, second=0, microsecond=0)
-            if last_ekb >= last_slot and candidate.date() <= last_slot.date():
-                candidate = last_slot + timedelta(days=1)
-
-        return candidate.astimezone(timezone.utc)
+        return self._next_probability_send_at(now, FREE_PROBABILITY_HOURS_EKB, last_sent)
 
     def _is_free_probability_due(self, now: datetime, last_sent: datetime | None) -> bool:
+        return self._is_probability_due(now, FREE_PROBABILITY_HOURS_EKB, last_sent)
+
+    def _probability_hours_for_sub(self, sub: UserSubscription) -> tuple[int, ...]:
+        if sub.user_id != self.settings.admin_chat_id and sub.effective_plan() == FREE_PLAN:
+            return FREE_PROBABILITY_HOURS_EKB
+        return PRO_PROBABILITY_HOURS_EKB
+
+    @staticmethod
+    def _slot_at(ekb_now: datetime, hour: int) -> datetime:
+        return ekb_now.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    def _is_probability_due(self, now: datetime, hours: tuple[int, ...], last_sent: datetime | None) -> bool:
         ekb_now = now.astimezone(EKB_TZ)
-        slot_today = ekb_now.replace(hour=8, minute=0, second=0, microsecond=0)
-        if ekb_now < slot_today:
+        last_ekb = last_sent.astimezone(EKB_TZ) if last_sent else None
+
+        for hour in sorted(hours, reverse=True):
+            slot = self._slot_at(ekb_now, hour)
+            if ekb_now < slot:
+                continue
+            if last_ekb is None or last_ekb < slot:
+                return True
             return False
-        if not last_sent:
-            return True
-        return last_sent.astimezone(EKB_TZ) < slot_today
+        return False
+
+    def _next_probability_send_at(self, now: datetime, hours: tuple[int, ...], last_sent: datetime | None) -> datetime:
+        ekb_now = now.astimezone(EKB_TZ)
+        last_ekb = last_sent.astimezone(EKB_TZ) if last_sent else None
+
+        for hour in sorted(hours):
+            slot = self._slot_at(ekb_now, hour)
+            if ekb_now > slot:
+                continue
+            if last_ekb is None or last_ekb < slot:
+                return slot.astimezone(timezone.utc)
+
+        next_day = ekb_now + timedelta(days=1)
+        first_slot = self._slot_at(next_day, min(hours))
+        return first_slot.astimezone(timezone.utc)
 
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -229,7 +251,7 @@ class BotService:
             return
 
         title = "Подписка Pro150 на 30 дней"
-        description = "Сигналы Pro: высокая вероятность 2 раза в день, крупные ставки каждые 5 минут, горячие ставки раз в час."
+        description = "Сигналы Pro: высокая вероятность в 08:00 и 19:00, крупные ставки каждую минуту, горячие ставки раз в час."
         payload = f"{PRO_INVOICE_PAYLOAD_PREFIX}:{update.effective_user.id}:{int(datetime.now(timezone.utc).timestamp())}"
 
         await context.bot.send_invoice(
@@ -463,12 +485,13 @@ class BotService:
         return None
 
     def _next_due_for_label(self, sub: UserSubscription, label: str, now: datetime) -> str:
-        if sub.user_id != self.settings.admin_chat_id and sub.effective_plan() == FREE_PLAN and label == "probability":
+        if label == "probability":
             last_sent = self._last_sent_for_label(sub, label)
-            if self._is_free_probability_due(now, last_sent):
+            hours = self._probability_hours_for_sub(sub)
+            if self._is_probability_due(now, hours, last_sent):
                 return self._format_ekb_time(now + timedelta(minutes=5))
-            next_free_due_at = self._next_free_probability_send_at(now, last_sent)
-            return self._format_ekb_time(next_free_due_at)
+            next_due_at = self._next_probability_send_at(now, hours, last_sent)
+            return self._format_ekb_time(next_due_at)
 
         interval = self._interval_for_label(sub, label)
         if interval is None:
@@ -487,8 +510,12 @@ class BotService:
         return self._format_ekb_time(due_at)
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
-        if sub.user_id != self.settings.admin_chat_id and sub.effective_plan() == FREE_PLAN and label == "probability":
-            return self._is_free_probability_due(now, self._last_sent_for_label(sub, label))
+        if label == "probability":
+            return self._is_probability_due(
+                now,
+                self._probability_hours_for_sub(sub),
+                self._last_sent_for_label(sub, label),
+            )
 
         interval = self._interval_for_label(sub, label)
         if interval is None:
@@ -514,8 +541,7 @@ class BotService:
             last = self._last_insider_analysis_at
             interval = INSIDER_ANALYSIS_INTERVAL
         elif label == "probability":
-            last = self._last_probability_analysis_at
-            interval = PROBABILITY_ANALYSIS_INTERVAL
+            return now
         elif label == "hot":
             last = self._last_hot_analysis_at
             interval = HOT_ANALYSIS_INTERVAL
@@ -524,6 +550,14 @@ class BotService:
         if last is None:
             return now
         return last + interval
+
+    def _is_probability_dispatch_due(self, now: datetime) -> bool:
+        for sub in self.store.active_users():
+            if not self._mode_allows_label(sub, "probability"):
+                continue
+            if self._is_due(sub, "probability", now):
+                return True
+        return False
 
     async def _notify_admin_analysis_started(self, label: str, now: datetime) -> None:
         labels = {
@@ -581,7 +615,7 @@ class BotService:
         markets = await self.client.fetch_markets()
 
         insider_due = self._analysis_enabled("insider") and self._is_analysis_due("insider", now)
-        probability_due = self._analysis_enabled("probability") and self._is_analysis_due("probability", now)
+        probability_due = self._analysis_enabled("probability") and self._is_probability_dispatch_due(now)
         hot_due = self._analysis_enabled("hot") and self._is_analysis_due("hot", now)
 
         insider_signals: list[InsiderSignal] = []
