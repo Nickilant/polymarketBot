@@ -35,7 +35,7 @@ logger = logging.getLogger("polymarket-telegram-bot")
 
 INSIDER_CHECK_INTERVAL_SECONDS = 300
 INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=5)
-PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=1)
+PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=12)
 HOT_ANALYSIS_INTERVAL = timedelta(hours=1)
 PRO_PRICE_STARS = 150
 PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
@@ -116,7 +116,7 @@ def welcome_text() -> str:
         "Привет! Я бот с сигналами Polymarket.\n\n"
         "Что отправляю:\n"
         "• Крупные ставки — крупные ставки от одного кошелька (каждые 5 минут).\n"
-        "• Высокая вероятность — ставки с высокой вероятностью выигрыша (каждый час для Pro/админа).\n"
+        "• Высокая вероятность — ставки с высокой вероятностью выигрыша (2 раза в день для Pro/админа).\n"
         "• Горячие ставки — по одной лучшей ставке каждый час без повторов в течение суток.\n\n"
         "Тарифы:\n"
         "• Free: только ставки высокой вероятности каждый день в 08:00 (Екатеринбург)\n"
@@ -229,7 +229,7 @@ class BotService:
             return
 
         title = "Подписка Pro150 на 30 дней"
-        description = "Сигналы Pro: высокая вероятность каждый час, крупные ставки каждые 5 минут, горячие ставки раз в час."
+        description = "Сигналы Pro: высокая вероятность 2 раза в день, крупные ставки каждые 5 минут, горячие ставки раз в час."
         payload = f"{PRO_INVOICE_PAYLOAD_PREFIX}:{update.effective_user.id}:{int(datetime.now(timezone.utc).timestamp())}"
 
         await context.bot.send_invoice(
@@ -463,7 +463,7 @@ class BotService:
         return None
 
     def _next_due_for_label(self, sub: UserSubscription, label: str, now: datetime) -> str:
-        if sub.effective_plan() == FREE_PLAN and label == "probability":
+        if sub.user_id != self.settings.admin_chat_id and sub.effective_plan() == FREE_PLAN and label == "probability":
             last_sent = self._last_sent_for_label(sub, label)
             if self._is_free_probability_due(now, last_sent):
                 return self._format_ekb_time(now + timedelta(minutes=5))
@@ -487,7 +487,7 @@ class BotService:
         return self._format_ekb_time(due_at)
 
     def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
-        if sub.effective_plan() == FREE_PLAN and label == "probability":
+        if sub.user_id != self.settings.admin_chat_id and sub.effective_plan() == FREE_PLAN and label == "probability":
             return self._is_free_probability_due(now, self._last_sent_for_label(sub, label))
 
         interval = self._interval_for_label(sub, label)
