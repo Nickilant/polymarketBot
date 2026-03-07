@@ -35,7 +35,7 @@ logger = logging.getLogger("polymarket-telegram-bot")
 
 INSIDER_CHECK_INTERVAL_SECONDS = 300
 INSIDER_ANALYSIS_INTERVAL = timedelta(minutes=5)
-PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=12)
+PROBABILITY_ANALYSIS_INTERVAL = timedelta(hours=1)
 HOT_ANALYSIS_INTERVAL = timedelta(hours=1)
 PRO_PRICE_STARS = 150
 PRO_INVOICE_PAYLOAD_PREFIX = "pro150"
@@ -116,7 +116,7 @@ def welcome_text() -> str:
         "Привет! Я бот с сигналами Polymarket.\n\n"
         "Что отправляю:\n"
         "• Крупные ставки — крупные ставки от одного кошелька (каждые 5 минут).\n"
-        "• Высокая вероятность — ставки с высокой вероятностью выигрыша (раз в 12 часов).\n"
+        "• Высокая вероятность — ставки с высокой вероятностью выигрыша (каждый час для Pro/админа).\n"
         "• Горячие ставки — по одной лучшей ставке каждый час без повторов в течение суток.\n\n"
         "Тарифы:\n"
         "• Free: только ставки высокой вероятности каждый день в 08:00 (Екатеринбург)\n"
@@ -229,7 +229,7 @@ class BotService:
             return
 
         title = "Подписка Pro150 на 30 дней"
-        description = "Сигналы Pro: высокая вероятность раз в 12 часов, крупные ставки каждые 5 минут, горячие ставки раз в час."
+        description = "Сигналы Pro: высокая вероятность каждый час, крупные ставки каждые 5 минут, горячие ставки раз в час."
         payload = f"{PRO_INVOICE_PAYLOAD_PREFIX}:{update.effective_user.id}:{int(datetime.now(timezone.utc).timestamp())}"
 
         await context.bot.send_invoice(
