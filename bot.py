@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import html
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -21,13 +24,13 @@ from telegram.ext import (
     filters,
 )
 
-from polymarket_bot.analyzer import Analyzer
+from polymarket_bot.analyzer import Analyzer, _rich_to_insider
 from polymarket_bot.config import Settings, load_settings
 from polymarket_bot.formatters import (
+    format_rich_insider_message,
     format_insider_message,
     format_probability_message,
     format_hot_message,
-    format_rich_insider_message,
 )
 from polymarket_bot.models import InsiderSignal, MarketView, ProbabilitySignal
 from polymarket_bot.polymarket_client import PolymarketClient
@@ -56,7 +59,6 @@ FREE_PROBABILITY_HOURS_EKB = (8,)
 PRO_PROBABILITY_HOURS_EKB = (8, 19)
 
 
-
 def welcome_text() -> str:
     return (
         "Привет! Я бот с сигналами Polymarket.\n\n"
@@ -67,7 +69,7 @@ def welcome_text() -> str:
         "Тарифы:\n"
         "• Free: только ставки высокой вероятности каждый день в 08:00 (Екатеринбург)\n"
         "• Pro: полный комплект информации\n"
-        "Купить Pro : /buy (Telegram Stars).\n"
+        "Купить Pro: /buy (Telegram Stars).\n"
         "Команды: /mode insider|probability|hot|both, /my, /buy, /stop"
     )
 
@@ -88,12 +90,23 @@ class BotService:
         self._last_admin_heartbeat_sent: datetime | None = None
         self._analysis_cache_path = Path(settings.subscriptions_db).resolve().parent / "latest_analysis.json"
         self._analysis_lock = asyncio.Lock()
+
         self._last_insider_analysis_at: datetime | None = None
         self._last_probability_analysis_at: datetime | None = None
         self._last_hot_analysis_at: datetime | None = None
+
+        # ── Кэши последних результатов — сохраняются между циклами ──────────
         self._last_probability_signals: list[ProbabilitySignal] = []
+        # [FIX] RichSignal кэш: используется для отправки, сохраняется между циклами
         self._last_rich_insider_signals: list[RichSignal] = []
+        # [FIX] InsiderSignal кэш для snapshot/signature — не теряется если цикл не отработал
+        self._last_insider_signals: list[InsiderSignal] = []
+
         self._register_handlers()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # HELPERS
+    # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _format_ekb_time(value: datetime) -> str:
@@ -108,12 +121,6 @@ class BotService:
         except ValueError:
             return None
 
-    def _next_free_probability_send_at(self, now: datetime, last_sent: datetime | None = None) -> datetime:
-        return self._next_probability_send_at(now, FREE_PROBABILITY_HOURS_EKB, last_sent)
-
-    def _is_free_probability_due(self, now: datetime, last_sent: datetime | None) -> bool:
-        return self._is_probability_due(now, FREE_PROBABILITY_HOURS_EKB, last_sent)
-
     def _probability_hours_for_sub(self, sub: UserSubscription) -> tuple[int, ...]:
         if sub.user_id != self.settings.admin_chat_id and sub.effective_plan() == FREE_PLAN:
             return FREE_PROBABILITY_HOURS_EKB
@@ -126,7 +133,6 @@ class BotService:
     def _is_probability_due(self, now: datetime, hours: tuple[int, ...], last_sent: datetime | None) -> bool:
         ekb_now = now.astimezone(EKB_TZ)
         last_ekb = last_sent.astimezone(EKB_TZ) if last_sent else None
-
         for hour in sorted(hours, reverse=True):
             slot = self._slot_at(ekb_now, hour)
             if ekb_now < slot:
@@ -139,17 +145,14 @@ class BotService:
     def _next_probability_send_at(self, now: datetime, hours: tuple[int, ...], last_sent: datetime | None) -> datetime:
         ekb_now = now.astimezone(EKB_TZ)
         last_ekb = last_sent.astimezone(EKB_TZ) if last_sent else None
-
         for hour in sorted(hours):
             slot = self._slot_at(ekb_now, hour)
             if ekb_now > slot:
                 continue
             if last_ekb is None or last_ekb < slot:
                 return slot.astimezone(timezone.utc)
-
         next_day = ekb_now + timedelta(days=1)
-        first_slot = self._slot_at(next_day, min(hours))
-        return first_slot.astimezone(timezone.utc)
+        return self._slot_at(next_day, min(hours)).astimezone(timezone.utc)
 
     def _next_probability_schedule_slot(self, now: datetime, hours: tuple[int, ...]) -> datetime:
         ekb_now = now.astimezone(EKB_TZ)
@@ -157,9 +160,151 @@ class BotService:
             slot = self._slot_at(ekb_now, hour)
             if ekb_now <= slot:
                 return slot.astimezone(timezone.utc)
-
         next_day = ekb_now + timedelta(days=1)
         return self._slot_at(next_day, min(hours)).astimezone(timezone.utc)
+
+    def _analysis_enabled(self, option: str) -> bool:
+        return self.settings.analysis_mode == "both" or self.settings.analysis_mode == option
+
+    def _hot_signature(self, signals: list[ProbabilitySignal]) -> str:
+        payload = [(s.market_id, s.leading_outcome, round(s.leading_probability, 4), round(s.gap, 4)) for s in signals]
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _hot_market_key(signal: ProbabilitySignal) -> str:
+        base_name = signal.market_name_en or signal.market_name_ru or signal.market_id
+        return " ".join(base_name.lower().split())
+
+    def _insider_signature(self, signals: list[InsiderSignal]) -> str:
+        payload = [
+            (s.market_id, s.wallet, s.outcome, round(s.amount_usd, 2), round(s.price, 4))
+            for s in signals
+        ]
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _daily_hot_reset_time(now: datetime) -> datetime:
+        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+    def _pick_next_hot_signal(self, hot_signals: list[ProbabilitySignal], now: datetime) -> ProbabilitySignal | None:
+        if not hot_signals:
+            return None
+        sent_keys, reset_at = self.store.get_global_hot_progress()
+        if reset_at is None or now >= reset_at:
+            sent_keys = []
+            reset_at = self._daily_hot_reset_time(now)
+        sent_set = set(sent_keys)
+        available = [s for s in hot_signals if self._hot_market_key(s) not in sent_set]
+        if not available:
+            sent_keys = []
+            reset_at = self._daily_hot_reset_time(now)
+            available = hot_signals
+        selected = available[0]
+        sent_keys.append(self._hot_market_key(selected))
+        self.store.set_global_hot_progress(sent_keys, reset_at)
+        return selected
+
+    def _interval_for_label(self, sub: UserSubscription, label: str) -> timedelta | None:
+        if sub.user_id == self.settings.admin_chat_id:
+            if label == "insider":
+                return INSIDER_ANALYSIS_INTERVAL
+            if label == "probability":
+                return PROBABILITY_ANALYSIS_INTERVAL
+            if label == "hot":
+                return HOT_ANALYSIS_INTERVAL
+            return None
+        if sub.effective_plan() == FREE_PLAN:
+            if label == "probability":
+                return timedelta(days=1)
+            return None
+        if label == "insider":
+            return INSIDER_ANALYSIS_INTERVAL
+        if label == "probability":
+            return PROBABILITY_ANALYSIS_INTERVAL
+        if label == "hot":
+            return HOT_ANALYSIS_INTERVAL
+        return None
+
+    def _last_sent_for_label(self, sub: UserSubscription, label: str) -> datetime | None:
+        if label == "insider":
+            return sub.last_sent_insider_at
+        if label == "probability":
+            return sub.last_sent_probability_at
+        if label == "hot":
+            return sub.last_sent_hot_at
+        return None
+
+    def _next_due_for_label(self, sub: UserSubscription, label: str, now: datetime) -> str:
+        if label == "probability":
+            last_sent = self._last_sent_for_label(sub, label)
+            hours = self._probability_hours_for_sub(sub)
+            if self._is_probability_due(now, hours, last_sent):
+                return self._format_ekb_time(now + timedelta(minutes=5))
+            return self._format_ekb_time(self._next_probability_send_at(now, hours, last_sent))
+        interval = self._interval_for_label(sub, label)
+        if interval is None:
+            return "недоступно для текущего тарифа/режима"
+        analysis_due_at = self._next_analysis_due_at(label, now)
+        last = self._last_sent_for_label(sub, label)
+        if last is None:
+            return self._format_ekb_time(analysis_due_at) if analysis_due_at else "сразу при следующем цикле"
+        due_at = last + interval
+        if analysis_due_at is not None and analysis_due_at > due_at:
+            due_at = analysis_due_at
+        if due_at <= now:
+            return self._format_ekb_time(now + timedelta(minutes=5))
+        return self._format_ekb_time(due_at)
+
+    def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
+        if label == "probability":
+            return self._is_probability_due(
+                now,
+                self._probability_hours_for_sub(sub),
+                self._last_sent_for_label(sub, label),
+            )
+        interval = self._interval_for_label(sub, label)
+        if interval is None:
+            return False
+        last = self._last_sent_for_label(sub, label)
+        return last is None or now - last >= interval
+
+    def _mode_allows_label(self, sub: UserSubscription, label: str) -> bool:
+        if sub.user_id == self.settings.admin_chat_id:
+            return True
+        if sub.effective_plan() == FREE_PLAN:
+            return label == "probability"
+        return sub.mode in {label, "both"}
+
+    def _is_analysis_due(self, label: str, now: datetime) -> bool:
+        due_at = self._next_analysis_due_at(label, now)
+        return due_at is not None and due_at <= now
+
+    def _next_analysis_due_at(self, label: str, now: datetime) -> datetime | None:
+        if label == "insider":
+            last = self._last_insider_analysis_at
+            interval = INSIDER_ANALYSIS_INTERVAL
+        elif label == "probability":
+            return now
+        elif label == "hot":
+            last = self._last_hot_analysis_at
+            interval = HOT_ANALYSIS_INTERVAL
+        else:
+            return None
+        if last is None:
+            return now
+        return last + interval
+
+    def _is_probability_dispatch_due(self, now: datetime) -> bool:
+        for sub in self.store.active_users():
+            if not self._mode_allows_label(sub, "probability"):
+                continue
+            if self._is_due(sub, "probability", now):
+                return True
+        return False
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # HANDLERS
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -199,27 +344,25 @@ class BotService:
         sub = self.store.ensure_free(update.effective_user.id)
         plan = "Pro150" if sub.effective_plan() == PRO_PLAN else "Free"
         paid_until = sub.paid_until.isoformat() if sub.paid_until else "-"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Тариф: {plan}\nРежим: {sub.mode}\nPro до: {paid_until}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Тариф: {plan}\nРежим: {sub.mode}\nPro до: {paid_until}",
+        )
 
     async def cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not update.effective_chat:
             return
-
-        title = "Подписка Pro150 на 30 дней"
-        description = "Сигналы Pro: высокая вероятность в 08:00 и 19:00, крупные ставки каждую минуту, горячие ставки раз в час."
         payload = f"{PRO_INVOICE_PAYLOAD_PREFIX}:{update.effective_user.id}:{int(datetime.now(timezone.utc).timestamp())}"
-
         await context.bot.send_invoice(
             chat_id=update.effective_chat.id,
-            title=title,
-            description=description,
+            title="Подписка Pro150 на 30 дней",
+            description="Сигналы Pro: высокая вероятность в 08:00 и 19:00, крупные ставки каждую минуту, горячие ставки раз в час.",
             payload=payload,
             currency="XTR",
             prices=[LabeledPrice("Pro150", PRO_PRICE_STARS)],
             provider_token=self.settings.telegram_payments_provider_token,
             start_parameter="pro150-stars",
         )
-
 
     async def precheckout_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.pre_checkout_query:
@@ -245,7 +388,6 @@ class BotService:
         if payment.currency != "XTR" or payment.total_amount != PRO_PRICE_STARS:
             logger.warning("Неожиданные параметры успешной оплаты: currency=%s amount=%s", payment.currency, payment.total_amount)
             return
-
         sub = self.store.grant_pro(update.effective_user.id)
         await update.message.reply_text(f"✅ Оплата получена! Pro150 активирован до {sub.paid_until.date().isoformat()}")
         await self.sender.send_to(
@@ -308,7 +450,13 @@ class BotService:
         probability_signals = [ProbabilitySignal(**raw) for raw in payload.get("probability_signals", [])]
         hot_signals = [ProbabilitySignal(**raw) for raw in payload.get("hot_signals", [])]
 
-        await context.bot.send_message(chat_id=chat_id, text=format_insider_message(insider_signals), parse_mode="HTML")
+        # [FIX] Используем rich кэш если есть, иначе fallback на snapshot
+        insider_text = (
+            format_rich_insider_message(self._last_rich_insider_signals)
+            if self._last_rich_insider_signals
+            else format_insider_message(insider_signals)
+        )
+        await context.bot.send_message(chat_id=chat_id, text=insider_text, parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_probability_message(probability_signals), parse_mode="HTML")
         await context.bot.send_message(chat_id=chat_id, text=format_hot_message(hot_signals), parse_mode="HTML")
 
@@ -321,228 +469,273 @@ class BotService:
 
         now = datetime.now(timezone.utc)
         admin_sub = self.store.ensure_free(self.settings.admin_chat_id)
-        next_free_schedule = self._format_ekb_time(self._next_probability_schedule_slot(now, FREE_PROBABILITY_HOURS_EKB))
+        active_users = self.store.active_users()
+        pro_count = sum(1 for s in active_users if s.effective_plan() == PRO_PLAN)
+        free_count = sum(1 for s in active_users if s.effective_plan() == FREE_PLAN)
+
+        # Последние результаты из кэша
+        rich = self._last_rich_insider_signals
+        signal_breakdown = ""
+        if rich:
+            kinds = Counter(s.kind.value for s in rich)
+            breakdown_lines = [f"  {kind}: {cnt}" for kind, cnt in kinds.most_common()]
+            signal_breakdown = "\n".join(breakdown_lines)
+        else:
+            signal_breakdown = "  нет данных (анализ ещё не запускался)"
+
         lines = [
-            "⏱ Следующее время рассылки подписчикам (Екатеринбург):",
-            f"Крупные ставки (Pro + админ): {self._next_due_for_label(admin_sub, 'insider', now)}",
-            f"Вероятность (Pro + админ): {self._next_due_for_label(admin_sub, 'probability', now)}",
-            f"Вероятность (Free): {next_free_schedule}",
-            f"Горячие (Pro + админ): {self._next_due_for_label(admin_sub, 'hot', now)}",
+            "⏱ <b>Статус анализатора</b>",
+            "",
+            "👥 <b>Подписчики:</b>",
+            f"  Всего активных: {len(active_users)}",
+            f"  Pro: {pro_count}  |  Free: {free_count}",
+            "",
+            "🕐 <b>Следующая рассылка (Екатеринбург):</b>",
+            f"  💰 Крупные ставки (Pro+админ): {self._next_due_for_label(admin_sub, 'insider', now)}",
+            f"  📈 Вероятность (Pro+админ):    {self._next_due_for_label(admin_sub, 'probability', now)}",
+            f"  📈 Вероятность (Free):         {self._format_ekb_time(self._next_probability_schedule_slot(now, FREE_PROBABILITY_HOURS_EKB))}",
+            f"  🔥 Горячие (Pro+админ):        {self._next_due_for_label(admin_sub, 'hot', now)}",
+            "",
+            "📊 <b>Последний анализ инсайдеров:</b>",
+            f"  Время: {self._format_ekb_time(self._last_insider_analysis_at) if self._last_insider_analysis_at else 'ещё не запускался'}",
+            f"  Сигналов найдено: {len(rich)}",
+            signal_breakdown,
+            "",
+            "📈 <b>Последний анализ вероятностей:</b>",
+            f"  Время: {self._format_ekb_time(self._last_probability_analysis_at) if self._last_probability_analysis_at else 'ещё не запускался'}",
+            f"  Сигналов: {len(self._last_probability_signals)}",
+            "",
+            "⚙️ <b>Режим анализа:</b> {mode}  |  Интервал цикла: {interval}с".format(
+                mode=self.settings.analysis_mode,
+                interval=INSIDER_CHECK_INTERVAL_SECONDS,
+            ),
         ]
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines))
-
-
-    def _free_reference_subscription(self, now: datetime) -> UserSubscription:
-        return UserSubscription(
-            user_id=0,
-            plan=FREE_PLAN,
-            mode="both",
-            created_at=now,
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="\n".join(lines),
+            parse_mode="HTML",
         )
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # MAIN LOOP
+    # ──────────────────────────────────────────────────────────────────────────
+
     async def analysis_loop(self) -> None:
-        logger.info("Запущен цикл анализа. Интервал проверки инсайдеров: %s сек.", INSIDER_CHECK_INTERVAL_SECONDS)
+        logger.info("=" * 60)
+        logger.info("Цикл анализа запущен. Интервал: %ds", INSIDER_CHECK_INTERVAL_SECONDS)
+        logger.info("Режим анализа: %s", self.settings.analysis_mode)
+        logger.info("Порог инсайдера: $%.0f", self.settings.insider_min_trade_usd)
+        logger.info("=" * 60)
         while True:
             now = datetime.now(timezone.utc)
             try:
                 await self._maybe_send_admin_heartbeat(now)
                 await self._run_cycle(now)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("Ошибка в цикле анализа: %s", exc)
             await asyncio.sleep(INSIDER_CHECK_INTERVAL_SECONDS)
 
     async def _maybe_send_admin_heartbeat(self, now: datetime) -> None:
         if self._last_admin_heartbeat_sent and (now - self._last_admin_heartbeat_sent).total_seconds() < 3600:
             return
+        active = self.store.active_users()
         heartbeat_text = (
-            "🫀 Служебный пинг бота\n"
+            "🫀 <b>Служебный пинг бота</b>\n"
             f"Время (Екатеринбург): {self._format_ekb_time(now)}\n"
-            "Статус: бот запущен и выполняет цикл анализа."
+            f"Статус: бот запущен и выполняет цикл анализа.\n"
+            f"Активных подписчиков: {len(active)}"
         )
-        await self.sender.send_to(self.settings.admin_chat_id, heartbeat_text)
+        await self.sender.send_to(self.settings.admin_chat_id, heartbeat_text, parse_mode="HTML")
         self._last_admin_heartbeat_sent = now
 
-    def _analysis_enabled(self, option: str) -> bool:
-        return self.settings.analysis_mode == "both" or self.settings.analysis_mode == option
+    # ──────────────────────────────────────────────────────────────────────────
+    # RUN CYCLE
+    # ──────────────────────────────────────────────────────────────────────────
 
-    def _hot_signature(self, signals: list[ProbabilitySignal]) -> str:
-        payload = [(s.market_id, s.leading_outcome, round(s.leading_probability, 4), round(s.gap, 4)) for s in signals]
-        return json.dumps(payload, ensure_ascii=False)
+    async def _run_cycle(self, now: datetime) -> None:
+        self.store.ensure_free(self.settings.admin_chat_id)
+        cycle_ts = now.strftime("%H:%M:%S")
 
-    @staticmethod
-    def _hot_market_key(signal: ProbabilitySignal) -> str:
-        base_name = signal.market_name_en or signal.market_name_ru or signal.market_id
-        return " ".join(base_name.lower().split())
+        insider_due = self._analysis_enabled("insider") and self._is_analysis_due("insider", now)
+        probability_due = self._analysis_enabled("probability") and self._is_probability_dispatch_due(now)
+        hot_due = self._analysis_enabled("hot") and self._is_analysis_due("hot", now)
 
-    def _insider_signature(self, signals: list[InsiderSignal]) -> str:
-        payload = [
-            (s.market_id, s.wallet, s.outcome, round(s.amount_usd, 2), round(s.price, 4))
-            for s in signals
-        ]
-        return json.dumps(payload, ensure_ascii=False)
-
-    def _log_hot_signals_snapshot(self, hot_signals: list[ProbabilitySignal], now: datetime) -> None:
-        if not hot_signals:
-            logger.info("Hot snapshot %s UTC: сигналов не найдено", now.isoformat(timespec="seconds"))
-            return
-
-        lines = [
-            f"{idx}. {signal.market_name_ru} | id={signal.market_id} | "
-            f"исход={signal.leading_outcome} | p={signal.leading_probability:.3f} | gap={signal.gap:.3f}"
-            for idx, signal in enumerate(hot_signals, start=1)
-        ]
         logger.info(
-            "Hot snapshot %s UTC (без фильтрации по истории отправок, всего=%s):\n%s",
-            now.isoformat(timespec="seconds"),
-            len(hot_signals),
-            "\n".join(lines),
+            "[%s] Цикл: insider_due=%s probability_due=%s hot_due=%s",
+            cycle_ts, insider_due, probability_due, hot_due,
         )
 
+        # [FIX] Используем кэшированные значения — не затираем если анализ не запускался
+        insider_signals: list[InsiderSignal] = self._last_insider_signals
+        probability_signals: list[ProbabilitySignal] = self._last_probability_signals
+        hot_signals: list[ProbabilitySignal] = []
 
-    @staticmethod
-    def _daily_hot_reset_time(now: datetime) -> datetime:
-        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+        # ── Анализ инсайдеров ─────────────────────────────────────────────────
+        if insider_due:
+            logger.info("[%s] → Запуск анализа инсайдеров...", cycle_ts)
+            markets = await self.client.fetch_markets()
+            trades = await self.client.fetch_recent_trades()
+            logger.info("[%s]   Рынков: %d | Трейдов: %d", cycle_ts, len(markets), len(trades))
 
-    def _pick_next_hot_signal(self, hot_signals: list[ProbabilitySignal], now: datetime) -> ProbabilitySignal | None:
-        if not hot_signals:
-            return None
+            rich_signals = await asyncio.to_thread(
+                self.analyzer.rich_insider_signals, trades, markets, self.settings.insider_top_n
+            )
+            self._last_rich_insider_signals = rich_signals
+            insider_signals = [_rich_to_insider(s) for s in rich_signals]
+            self._last_insider_signals = insider_signals
+            self._last_insider_analysis_at = now
 
-        sent_keys, reset_at = self.store.get_global_hot_progress()
-        if reset_at is None or now >= reset_at:
-            sent_keys = []
-            reset_at = self._daily_hot_reset_time(now)
+            # Лог разбивки по типам
+            if rich_signals:
+                kinds = Counter(s.kind.value for s in rich_signals)
+                breakdown = " | ".join(f"{k}:{v}" for k, v in kinds.most_common())
+                strong = sum(1 for s in rich_signals if s.is_strong)
+                logger.info(
+                    "[%s]   Сигналов: %d (сильных: %d) | %s",
+                    cycle_ts, len(rich_signals), strong, breakdown,
+                )
+            else:
+                logger.info("[%s]   Сигналов не найдено", cycle_ts)
+        else:
+            # Если анализ не запускался — берём рынки только для probability/hot
+            markets = None
 
-        sent_set = set(sent_keys)
-        available = [signal for signal in hot_signals if self._hot_market_key(signal) not in sent_set]
+        # ── Анализ вероятностей ───────────────────────────────────────────────
+        if probability_due:
+            logger.info("[%s] → Запуск анализа вероятностей...", cycle_ts)
+            if markets is None:
+                markets = await self.client.fetch_markets()
+                logger.info("[%s]   Рынков: %d", cycle_ts, len(markets))
+            probability_signals = await asyncio.to_thread(
+                self.analyzer.probability_signals, markets, self.settings.probability_top_n
+            )
+            self._last_probability_signals = probability_signals
+            self._last_probability_analysis_at = now
+            logger.info("[%s]   Вероятностных сигналов: %d", cycle_ts, len(probability_signals))
 
-        if not available:
-            sent_keys = []
-            reset_at = self._daily_hot_reset_time(now)
-            available = hot_signals
+        # ── Анализ горячих ────────────────────────────────────────────────────
+        if hot_due:
+            logger.info("[%s] → Запуск анализа горячих ставок...", cycle_ts)
+            if markets is None:
+                markets = await self.client.fetch_markets()
+                logger.info("[%s]   Рынков: %d", cycle_ts, len(markets))
+            hot_signals = await asyncio.to_thread(
+                self.analyzer.hot_signals, markets, self.settings.hot_top_n
+            )
+            self._last_hot_analysis_at = now
+            self._log_hot_signals_snapshot(hot_signals, now)
 
-        selected = available[0]
-        sent_keys.append(self._hot_market_key(selected))
-        self.store.set_global_hot_progress(sent_keys, reset_at)
-        return selected
+        # ── Snapshot ──────────────────────────────────────────────────────────
+        previous_snapshot = await self._load_analysis_snapshot() or {}
+        previous_hot_sig = str(previous_snapshot.get("hot_signature") or "")
+        previous_insider_sig = str(previous_snapshot.get("insider_signature") or "")
+        hot_signature = self._hot_signature(hot_signals) if hot_due else previous_hot_sig
+        insider_signature = self._insider_signature(insider_signals) if insider_due else previous_insider_sig
+        hot_changed = hot_due and hot_signature != previous_hot_sig
+        insider_changed = insider_due and insider_signature != previous_insider_sig
 
-    def _interval_for_label(self, sub: UserSubscription, label: str) -> timedelta | None:
-        if sub.user_id == self.settings.admin_chat_id:
-            if label == "insider":
-                return INSIDER_ANALYSIS_INTERVAL
-            if label == "probability":
-                return PROBABILITY_ANALYSIS_INTERVAL
-            if label == "hot":
-                return HOT_ANALYSIS_INTERVAL
-            return None
-
-        if sub.effective_plan() == FREE_PLAN:
-            if label == "probability":
-                return timedelta(days=1)
-            return None
-
-        if label == "insider":
-            return INSIDER_ANALYSIS_INTERVAL
-        if label == "probability":
-            return PROBABILITY_ANALYSIS_INTERVAL
-        if label == "hot":
-            return HOT_ANALYSIS_INTERVAL
-        return None
-
-    def _last_sent_for_label(self, sub: UserSubscription, label: str) -> datetime | None:
-        if label == "insider":
-            return sub.last_sent_insider_at
-        if label == "probability":
-            return sub.last_sent_probability_at
-        if label == "hot":
-            return sub.last_sent_hot_at
-        return None
-
-    def _next_due_for_label(self, sub: UserSubscription, label: str, now: datetime) -> str:
-        if label == "probability":
-            last_sent = self._last_sent_for_label(sub, label)
-            hours = self._probability_hours_for_sub(sub)
-            if self._is_probability_due(now, hours, last_sent):
-                return self._format_ekb_time(now + timedelta(minutes=5))
-            next_due_at = self._next_probability_send_at(now, hours, last_sent)
-            return self._format_ekb_time(next_due_at)
-
-        interval = self._interval_for_label(sub, label)
-        if interval is None:
-            return "недоступно для текущего тарифа/режима"
-        analysis_due_at = self._next_analysis_due_at(label, now)
-        last = self._last_sent_for_label(sub, label)
-        if last is None:
-            if analysis_due_at is None:
-                return "сразу при следующем цикле"
-            return self._format_ekb_time(analysis_due_at)
-        due_at = last + interval
-        if analysis_due_at is not None and analysis_due_at > due_at:
-            due_at = analysis_due_at
-        if due_at <= now:
-            return self._format_ekb_time(now + timedelta(minutes=5))
-        return self._format_ekb_time(due_at)
-
-    def _is_due(self, sub: UserSubscription, label: str, now: datetime) -> bool:
-        if label == "probability":
-            return self._is_probability_due(
+        if insider_due or probability_due or hot_due:
+            await self._save_analysis_snapshot(
                 now,
-                self._probability_hours_for_sub(sub),
-                self._last_sent_for_label(sub, label),
+                markets or [],
+                insider_signals,
+                probability_signals,
+                hot_signals,
+                hot_signature,
+                insider_signature,
             )
 
-        interval = self._interval_for_label(sub, label)
-        if interval is None:
-            return False
-        last = self._last_sent_for_label(sub, label)
-        return last is None or now - last >= interval
+        # ── Выбор горячего сигнала ────────────────────────────────────────────
+        selected_hot_signal = self._pick_next_hot_signal(hot_signals, now) if hot_due else None
 
-    def _mode_allows_label(self, sub: UserSubscription, label: str) -> bool:
-        if sub.user_id == self.settings.admin_chat_id:
-            return True
-        if sub.effective_plan() == FREE_PLAN:
-            return label == "probability"
-        return sub.mode in {label, "both"}
-
-    def _is_analysis_due(self, label: str, now: datetime) -> bool:
-        due_at = self._next_analysis_due_at(label, now)
-        if due_at is None:
-            return False
-        return due_at <= now
-
-    def _next_analysis_due_at(self, label: str, now: datetime) -> datetime | None:
-        if label == "insider":
-            last = self._last_insider_analysis_at
-            interval = INSIDER_ANALYSIS_INTERVAL
-        elif label == "probability":
-            return now
-        elif label == "hot":
-            last = self._last_hot_analysis_at
-            interval = HOT_ANALYSIS_INTERVAL
-        else:
-            return None
-        if last is None:
-            return now
-        return last + interval
-
-    def _is_probability_dispatch_due(self, now: datetime) -> bool:
-        for sub in self.store.active_users():
-            if not self._mode_allows_label(sub, "probability"):
-                continue
-            if self._is_due(sub, "probability", now):
-                return True
-        return False
-
-    async def _notify_admin_analysis_started(self, label: str, now: datetime) -> None:
-        labels = {
-            "insider": "крупных ставок",
-            "probability": "высокой вероятности",
-            "hot": "горячих ставок",
-        }
-        logger.info(
-            "Начинается анализ %s (%s UTC)",
-            labels.get(label, label),
-            now.isoformat(timespec="seconds"),
+        # ── Формирование сообщений ────────────────────────────────────────────
+        # [FIX] insider — всегда используем rich кэш если он есть
+        insider_msg = (
+            format_rich_insider_message(self._last_rich_insider_signals)
+            if self._last_rich_insider_signals
+            else format_insider_message(insider_signals)
         )
+        messages = {
+            "insider": insider_msg,
+            "probability": format_probability_message(probability_signals),
+            "hot": format_hot_message([selected_hot_signal]) if selected_hot_signal else "",
+        }
+
+        logger.info(
+            "[%s] Сообщения сформированы | insider=%d chars | probability=%d chars | hot=%d chars",
+            cycle_ts,
+            len(messages["insider"]),
+            len(messages["probability"]),
+            len(messages["hot"]),
+        )
+
+        # ── Рассылка ──────────────────────────────────────────────────────────
+        for user_id, days, paid_until in self.store.due_renewal_reminders(now):
+            reminder_text = (
+                f"⏳ До окончания Pro150 осталось {days} дн.\n"
+                f"Продли подписку (150 ⭐) командой /buy.\n"
+                f"Текущий срок до: {paid_until.date().isoformat()}"
+            )
+            await self.sender.send_to(user_id, reminder_text)
+            self.store.mark_reminder_sent(user_id, days, paid_until)
+
+        sent_users: set[int] = set()
+        sent_by_label: dict[str, int] = {"insider": 0, "probability": 0, "hot": 0}
+
+        for sub in self.store.active_users():
+            for label in ("insider", "probability", "hot"):
+                if not self._analysis_enabled(label):
+                    continue
+                if label == "insider" and not insider_due:
+                    continue
+                if label == "probability" and not probability_due:
+                    continue
+                if label == "hot" and not hot_due:
+                    continue
+                if not self._mode_allows_label(sub, label):
+                    continue
+                if label != "hot" and not self._is_due(sub, label, now):
+                    continue
+                if label == "insider" and not self._last_rich_insider_signals:
+                    logger.debug("[%s] Пропуск insider для user=%d — нет сигналов", cycle_ts, sub.user_id)
+                    continue
+                if label == "hot" and not messages["hot"]:
+                    continue
+
+                parse_mode = "HTML"
+                logger.debug(
+                    "[%s] → Отправка [%s] → user_id=%d plan=%s",
+                    cycle_ts, label, sub.user_id, sub.effective_plan(),
+                )
+                try:
+                    await self.sender.send_to(sub.user_id, messages[label], parse_mode=parse_mode)
+                    self.store.mark_sent(sub.user_id, label, now)
+                    sent_users.add(sub.user_id)
+                    sent_by_label[label] += 1
+                except Exception as exc:
+                    logger.error(
+                        "[%s] Ошибка отправки [%s] → user_id=%d: %s",
+                        cycle_ts, label, sub.user_id, exc,
+                    )
+
+        # ── Итог цикла ────────────────────────────────────────────────────────
+        due_by_label = {"insider": insider_due, "probability": probability_due, "hot": hot_due}
+        for label, count in sent_by_label.items():
+            if due_by_label[label] and count > 0:
+                await self._notify_admin_distribution(label, count, now)
+
+        logger.info(
+            "[%s] ✓ Цикл завершён | Отправлено: insider=%d probability=%d hot=%d | Уникальных получателей: %d",
+            cycle_ts,
+            sent_by_label["insider"],
+            sent_by_label["probability"],
+            sent_by_label["hot"],
+            len(sent_users),
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ADMIN NOTIFICATIONS
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def _notify_admin_distribution(self, label: str, sent_count: int, now: datetime) -> None:
         labels = {
@@ -558,149 +751,22 @@ class BotService:
                 f"Получателей: {sent_count}"
             ),
         )
-
-    async def _send_admin_cycle_report(
-        self,
-        now: datetime,
-        markets_count: int,
-        insider_signals_count: int,
-        probability_signals_count: int,
-        hot_signals_count: int,
-        insider_changed: bool,
-        hot_changed: bool,
-    ) -> None:
+    def _log_hot_signals_snapshot(self, hot_signals: list[ProbabilitySignal], now: datetime) -> None:
+        if not hot_signals:
+            logger.info("Hot snapshot %s UTC: сигналов не найдено", now.strftime("%H:%M:%S"))
+            return
+        lines = [
+            f"  {idx}. {s.market_name_ru} | p={s.leading_probability:.2f} | gap={s.gap:.2f}"
+            for idx, s in enumerate(hot_signals, 1)
+        ]
         logger.info(
-            (
-                "Короткий отчёт анализа | UTC: %s | Рынков: %s | "
-                "Крупные ставки: %s (%s) | Вероятность: %s | Горячие: %s (%s)"
-            ),
-            now.isoformat(timespec="seconds"),
-            markets_count,
-            insider_signals_count,
-            "изменились" if insider_changed else "без изменений",
-            probability_signals_count,
-            hot_signals_count,
-            "изменились" if hot_changed else "без изменений",
+            "Hot snapshot %s UTC (%d сигналов):\n%s",
+            now.strftime("%H:%M:%S"), len(hot_signals), "\n".join(lines),
         )
 
-    async def _run_cycle(self, now: datetime) -> None:
-        self.store.ensure_free(self.settings.admin_chat_id)
-        markets = await self.client.fetch_markets()
-
-        insider_due = self._analysis_enabled("insider") and self._is_analysis_due("insider", now)
-        probability_due = self._analysis_enabled("probability") and self._is_probability_dispatch_due(now)
-        hot_due = self._analysis_enabled("hot") and self._is_analysis_due("hot", now)
-
-        insider_signals: list[InsiderSignal] = []
-        probability_signals: list[ProbabilitySignal] = self._last_probability_signals
-        hot_signals: list[ProbabilitySignal] = []
-
-        if insider_due:
-            await self._notify_admin_analysis_started("insider", now)
-            trades = await self.client.fetch_recent_trades()
-            rich_signals = await asyncio.to_thread(
-                self.analyzer.rich_insider_signals, trades, markets, self.settings.insider_top_n
-            )
-            self._last_rich_insider_signals = rich_signals
-            # insider_signals нужен для snapshot/signature — конвертируем
-            from polymarket_bot.analyzer import _rich_to_insider
-            insider_signals = [_rich_to_insider(s) for s in rich_signals]
-            self._last_insider_analysis_at = now
-
-        if probability_due:
-            await self._notify_admin_analysis_started("probability", now)
-            probability_signals = await asyncio.to_thread(self.analyzer.probability_signals, markets, self.settings.probability_top_n)
-            self._last_probability_signals = probability_signals
-            self._last_probability_analysis_at = now
-
-        if hot_due:
-            await self._notify_admin_analysis_started("hot", now)
-            hot_signals = await asyncio.to_thread(self.analyzer.hot_signals, markets, self.settings.hot_top_n)
-            self._last_hot_analysis_at = now
-
-        previous_snapshot = await self._load_analysis_snapshot() or {}
-        previous_hot_signature = str(previous_snapshot.get("hot_signature") or "")
-        previous_insider_signature = str(previous_snapshot.get("insider_signature") or "")
-        hot_signature = self._hot_signature(hot_signals) if hot_due else previous_hot_signature
-        insider_signature = self._insider_signature(insider_signals) if insider_due else previous_insider_signature
-        hot_changed = hot_due and hot_signature != previous_hot_signature
-        insider_changed = insider_due and insider_signature != previous_insider_signature
-
-        await self._save_analysis_snapshot(
-            now,
-            markets,
-            insider_signals,
-            probability_signals,
-            hot_signals,
-            hot_signature,
-            insider_signature,
-        )
-
-        if hot_due:
-            self._log_hot_signals_snapshot(hot_signals, now)
-        selected_hot_signal = self._pick_next_hot_signal(hot_signals, now) if hot_due else None
-        messages = {
-            "insider": format_rich_insider_message(
-                self._last_rich_insider_signals) if self._last_rich_insider_signals else format_insider_message(
-                insider_signals),
-            "probability": format_probability_message(probability_signals),
-            "hot": format_hot_message([selected_hot_signal]) if selected_hot_signal else "",
-        }
-
-        await self._send_admin_cycle_report(
-            now=now,
-            markets_count=len(markets),
-            insider_signals_count=len(insider_signals),
-            probability_signals_count=len(probability_signals),
-            hot_signals_count=len(hot_signals),
-            insider_changed=insider_changed,
-            hot_changed=hot_changed,
-        )
-
-        for user_id, days, paid_until in self.store.due_renewal_reminders(now):
-            reminder_text = (
-                f"⏳ До окончания Pro150 осталось {days} дн.\n"
-                f"Продли подписку (150 ⭐) в @PremiumBot.\n"
-                f"Текущий срок до: {paid_until.date().isoformat()}"
-            )
-            await self.sender.send_to(user_id, reminder_text)
-            self.store.mark_reminder_sent(user_id, days, paid_until)
-
-        sent_users: set[int] = set()
-        sent_by_label = {"insider": 0, "probability": 0, "hot": 0}
-        for sub in self.store.active_users():
-            for label in ("insider", "probability", "hot"):
-                if not self._analysis_enabled(label):
-                    continue
-                if label == "insider" and not insider_due:
-                    continue
-                if label == "probability" and not probability_due:
-                    continue
-                if label == "hot" and not hot_due:
-                    continue
-                if not self._mode_allows_label(sub, label):
-                    continue
-                if label != "hot" and not self._is_due(sub, label, now):
-                    continue
-                if label == "insider" and not insider_signals:
-                    continue
-
-                parse_mode = "HTML" if label in {"insider", "probability", "hot"} else None
-                if label == "hot" and not messages["hot"]:
-                    continue
-
-                await self.sender.send_to(sub.user_id, messages[label], parse_mode=parse_mode)
-
-                self.store.mark_sent(sub.user_id, label, now)
-                sent_users.add(sub.user_id)
-                sent_by_label[label] += 1
-
-        due_by_label = {"insider": insider_due, "probability": probability_due, "hot": hot_due}
-        for label, count in sent_by_label.items():
-            if due_by_label[label] and count > 0:
-                await self._notify_admin_distribution(label, count, now)
-
-        logger.info("Цикл завершён. Пользователей, получивших рассылку: %s", len(sent_users))
+    # ──────────────────────────────────────────────────────────────────────────
+    # SNAPSHOT
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def _save_analysis_snapshot(
         self,
@@ -720,12 +786,14 @@ class BotService:
             "hot_signals_count": len(hot_signals),
             "hot_signature": hot_signature,
             "insider_signature": insider_signature,
-            "insider_signals": [signal.__dict__ for signal in insider_signals],
-            "probability_signals": [signal.__dict__ for signal in probability_signals],
-            "hot_signals": [signal.__dict__ for signal in hot_signals],
+            "insider_signals": [s.__dict__ for s in insider_signals],
+            "probability_signals": [s.__dict__ for s in probability_signals],
+            "hot_signals": [s.__dict__ for s in hot_signals],
         }
         async with self._analysis_lock:
-            self._analysis_cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._analysis_cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
     async def _load_analysis_snapshot(self) -> dict[str, Any] | None:
         async with self._analysis_lock:
@@ -735,6 +803,10 @@ class BotService:
                 return json.loads(self._analysis_cache_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STARTUP / RUN
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         await self.application.initialize()
@@ -752,15 +824,21 @@ class BotService:
             await self.application.shutdown()
 
     async def _send_startup_message_to_admin(self) -> None:
+        active = self.store.active_users()
         startup_text = (
-            "✅ Бот запущен и готов к работе.\n\n"
-            f"Режим анализа: {self.settings.analysis_mode}\n"
-            f"Интервал цикла: {self.settings.polling_interval_seconds} сек.\n\n"
-            "Справка по командам:\n"
-            f"{welcome_text()}\n\n"
-            "Админ-команды: /analysis — последние данные, /next_analysis — время следующей рассылки по видам анализа."
+            "✅ <b>Бот запущен и готов к работе.</b>\n\n"
+            f"Режим анализа: <b>{self.settings.analysis_mode}</b>\n"
+            f"Интервал цикла: {INSIDER_CHECK_INTERVAL_SECONDS}с\n"
+            f"Порог сигнала: ${self.settings.insider_min_trade_usd:,.0f}\n"
+            f"Активных подписчиков: {len(active)}\n\n"
+            "Детекторы активны:\n"
+            "• Whale Trade / Whale Position\n"
+            "• Position Sweep / Stealth Accumulation\n"
+            "• Coordinated / Clustered Coordination\n"
+            "• Cross-Market Insider\n\n"
+            "Админ-команды: /analysis /next_analysis /grant"
         )
-        await self.sender.send_to(self.settings.admin_chat_id, startup_text)
+        await self.sender.send_to(self.settings.admin_chat_id, startup_text, parse_mode="HTML")
 
 
 async def main() -> None:
